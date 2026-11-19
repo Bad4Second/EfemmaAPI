@@ -140,6 +140,7 @@ service cloud.firestore {
         (!('deletedEndpointIds' in data) || (data.deletedEndpointIds is list && data.deletedEndpointIds.size() <= 100 && (data.deletedEndpointIds.size() == 0 || data.deletedEndpointIds[0] is string))) &&
         (!('privateEndpointIds' in data) || (data.privateEndpointIds is list && data.privateEndpointIds.size() <= 100 && (data.privateEndpointIds.size() == 0 || data.privateEndpointIds[0] is string))) &&
         (!('privateEndpointRoles' in data) || (data.privateEndpointRoles is map && data.privateEndpointRoles.size() <= 100)) &&
+        (!('endpointNotices' in data) || (data.endpointNotices is map && data.endpointNotices.size() <= 100)) &&
         (!('footerLinks' in data) || (data.footerLinks is list && data.footerLinks.size() <= 10 && (data.footerLinks.size() == 0 || data.footerLinks[0] is map))) &&
         (!('csChannels' in data) || (data.csChannels is list && data.csChannels.size() <= 10 && (data.csChannels.size() == 0 || data.csChannels[0] is map))) &&
         (!('faqItems' in data) || (data.faqItems is list && data.faqItems.size() <= 25 && (data.faqItems.size() == 0 || data.faqItems[0] is map))) &&
@@ -169,7 +170,7 @@ service cloud.firestore {
           'footerTitle', 'footerVersion', 'footerLinks', 'footerGithubUrl',
           'footerBrandDesc', 'footerCopyright', 'footerRightNote',
           'spotifyPlayerTitle', 'spotifyPlayerBadge', 'spotifyPlayerDesc', 'categoryOrder',
-          'hiddenCategories', 'hiddenEndpointIds', 'deletedEndpointIds', 'privateEndpointIds', 'privateEndpointRoles',
+          'hiddenCategories', 'hiddenEndpointIds', 'deletedEndpointIds', 'privateEndpointIds', 'privateEndpointRoles', 'endpointNotices',
           'hubCsLabel', 'hubFaqLabel', 'hubSosmedLabel', 'hubPublicChatLabel',
           'csPageTitle', 'csPageSubtitle', 'csResponseHours', 'csChannels',
           'faqPageTitle', 'faqPageSubtitle', 'faqItems',

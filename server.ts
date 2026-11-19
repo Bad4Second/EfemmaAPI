@@ -10,6 +10,7 @@ import { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import dotenv from 'dotenv';
+import { registerDramaBoxRoutes } from './server/dramabox.ts';
 
 const execFileAsync = promisify(execFile);
 
@@ -95,6 +96,22 @@ const PATH_TO_ENDPOINT_ID: Record<string, string> = {
   '/streaming/pinedrama/search': 'pinedrama-search',
   '/streaming/pinedrama/detail': 'pinedrama-detail',
   '/streaming/pinedrama/get-episodes': 'pinedrama-get-episodes',
+  '/streaming/dramabox/browse': 'dramabox-browse',
+  '/streaming/dramabox/categories': 'dramabox-categories',
+  '/streaming/dramabox/category-books': 'dramabox-category-books',
+  '/streaming/dramabox/channels': 'dramabox-channels',
+  '/streaming/dramabox/drama': 'dramabox-drama',
+  '/streaming/dramabox/genres': 'dramabox-genres',
+  '/streaming/dramabox/home': 'dramabox-home',
+  '/streaming/dramabox/more': 'dramabox-more',
+  '/streaming/dramabox/performer': 'dramabox-performer',
+  '/streaming/dramabox/rank': 'dramabox-rank',
+  '/streaming/dramabox/recommend': 'dramabox-recommend',
+  '/streaming/dramabox/search': 'dramabox-search',
+  '/streaming/dramabox/suggest': 'dramabox-suggest',
+  '/streaming/dramabox/tag': 'dramabox-tag',
+  '/streaming/dramabox/theater': 'dramabox-theater',
+  '/streaming/dramabox/trending': 'dramabox-trending',
 };
 
 function normalizeServerRoleKey(raw: string): string {
@@ -1177,6 +1194,22 @@ async function createServer() {
       { metode: 'GET', jalur: '/api/v1/streaming/pinedrama/search', kategori: 'streaming' },
       { metode: 'GET', jalur: '/api/v1/streaming/pinedrama/detail', kategori: 'streaming' },
       { metode: 'GET', jalur: '/api/v1/streaming/pinedrama/get-episodes', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/browse', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/categories', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/category-books', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/channels', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/drama', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/genres', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/home', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/more', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/performer', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/rank', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/recommend', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/search', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/suggest', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/tag', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/theater', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/dramabox/trending', kategori: 'streaming' },
     ];
     const activeEndpoints = allEndpoints.filter((ep) => {
       const subPath = ep.jalur.replace(/^\/api\/v1/, '');
@@ -6703,6 +6736,9 @@ async function createServer() {
     });
     return nodeStream.pipe(res);
   });
+
+  // 27–42. DramaBox Streaming Endpoints (GET /api/v1/streaming/dramabox/*)
+  registerDramaBoxRoutes(app);
 
   // Catch-all for unknown /api/* routes
   app.all('/api/*', (req: Request, res: Response) => {

@@ -135,6 +135,7 @@
         "deletedEndpointIds": { "type": "array" },
         "privateEndpointIds": { "type": "array" },
         "privateEndpointRoles": { "type": "object" },
+        "endpointNotices": { "type": "object", "description": "Teks informasi khusus per endpoint ID yang diatur Admin." },
         "hubCsLabel": { "type": "string", "maxLength": 40 },
         "hubFaqLabel": { "type": "string", "maxLength": 40 },
         "hubSosmedLabel": { "type": "string", "maxLength": 40 },

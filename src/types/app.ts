@@ -155,6 +155,7 @@ export interface SiteContent {
   deletedEndpointIds: string[];
   privateEndpointIds: string[];
   privateEndpointRoles: Record<string, UserRole[]>;
+  endpointNotices: Record<string, string>;
   hubCsLabel: string;
   hubFaqLabel: string;
   hubSosmedLabel: string;
@@ -325,6 +326,7 @@ export const DEFAULT_SITE_CONTENT: SiteContent = {
   deletedEndpointIds: [],
   privateEndpointIds: [],
   privateEndpointRoles: {},
+  endpointNotices: {},
   hubCsLabel: 'Kontak CS',
   hubFaqLabel: 'FAQ',
   hubSosmedLabel: 'Sosmed',

@@ -26,6 +26,13 @@ import {
   PineDramaParsedPayload,
 } from '../components/PineDramaPanel';
 import {
+  DramaBoxDramaCard,
+  DramaBoxEpisodePreview,
+  DramaBoxPanel,
+  DramaBoxParsedPayload,
+  DramaBoxPerformerCard,
+} from '../components/DramaBoxPanel';
+import {
   API_ENDPOINTS,
   ApiEndpointSpec,
   buildPostBody,
@@ -163,6 +170,25 @@ export function EndpointDocPage({
       sessionStorage.removeItem('efemma_pending_pinedrama_slug');
       sessionStorage.removeItem('efemma_pending_pinedrama_lang');
       sessionStorage.removeItem('efemma_pending_pinedrama_target');
+    }
+    const pendingDbBookId = sessionStorage.getItem('efemma_pending_dramabox_book_id');
+    const pendingDbPerfId = sessionStorage.getItem('efemma_pending_dramabox_performer_id');
+    const pendingDbLang = sessionStorage.getItem('efemma_pending_dramabox_lang');
+    const pendingDbTarget = sessionStorage.getItem('efemma_pending_dramabox_target');
+    if (pendingDbTarget === endpoint.id) {
+      if (pendingDbBookId && 'book_id' in initial) {
+        initial.book_id = pendingDbBookId;
+      }
+      if (pendingDbPerfId && 'performer_id' in initial) {
+        initial.performer_id = pendingDbPerfId;
+      }
+      if (pendingDbLang && 'lang' in initial) {
+        initial.lang = pendingDbLang;
+      }
+      sessionStorage.removeItem('efemma_pending_dramabox_book_id');
+      sessionStorage.removeItem('efemma_pending_dramabox_performer_id');
+      sessionStorage.removeItem('efemma_pending_dramabox_lang');
+      sessionStorage.removeItem('efemma_pending_dramabox_target');
     }
     setParamValues(initial);
     setLiveResponse(null);
@@ -570,7 +596,12 @@ export function EndpointDocPage({
   }, [liveResponse, endpoint.category]);
 
   const parsedPineDramaData = useMemo<PineDramaParsedPayload | null>(() => {
-    if (!liveResponse || liveResponse.isError || endpoint.category !== 'streaming') {
+    if (
+      !liveResponse ||
+      liveResponse.isError ||
+      endpoint.category !== 'streaming' ||
+      endpoint.subGroup !== 'PineDrama'
+    ) {
       return null;
     }
     try {
@@ -690,7 +721,159 @@ export function EndpointDocPage({
     } catch {
       return null;
     }
-  }, [liveResponse, endpoint.category, endpoint.id, paramValues.lang, pineExtraEpisodes]);
+  }, [liveResponse, endpoint.category, endpoint.subGroup, endpoint.id, paramValues.lang, pineExtraEpisodes]);
+
+  const parsedDramaBoxData = useMemo<DramaBoxParsedPayload | null>(() => {
+    if (
+      !liveResponse ||
+      liveResponse.isError ||
+      endpoint.category !== 'streaming' ||
+      endpoint.subGroup !== 'DramaBox'
+    ) {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(liveResponse.bodyText) as Record<string, unknown>;
+      if (!parsed.sukses) return null;
+
+      const layanan =
+        typeof parsed.layanan === 'string' && parsed.layanan ? parsed.layanan : endpoint.id;
+      const bahasa =
+        typeof parsed.bahasa === 'string' && parsed.bahasa
+          ? parsed.bahasa
+          : paramValues.lang || 'in';
+
+      const toPerformer = (raw: unknown): DramaBoxPerformerCard | null => {
+        if (!raw || typeof raw !== 'object') return null;
+        const p = raw as Record<string, unknown>;
+        const performer_id = typeof p.performer_id === 'string' ? p.performer_id : '';
+        const nama = typeof p.nama === 'string' ? p.nama : '';
+        if (!performer_id || !nama) return null;
+        return {
+          performer_id,
+          nama,
+          slug: typeof p.slug === 'string' ? p.slug : '',
+          avatar: typeof p.avatar === 'string' ? p.avatar : null,
+          jumlah_video: typeof p.jumlah_video === 'number' ? p.jumlah_video : 1,
+        };
+      };
+
+      const toDramaCard = (raw: unknown): DramaBoxDramaCard | null => {
+        if (!raw || typeof raw !== 'object') return null;
+        const d = raw as Record<string, unknown>;
+        const book_id = typeof d.book_id === 'string' ? d.book_id : '';
+        const judul = typeof d.judul === 'string' ? d.judul : '';
+        if (!book_id || !judul) return null;
+        return {
+          book_id,
+          judul,
+          sampul: typeof d.sampul === 'string' ? d.sampul : null,
+          rating: typeof d.rating === 'number' ? d.rating : null,
+          jumlah_episode: typeof d.jumlah_episode === 'number' ? d.jumlah_episode : null,
+          penayangan: typeof d.penayangan === 'string' ? d.penayangan : null,
+          pengikut: typeof d.pengikut === 'number' ? d.pengikut : undefined,
+          sinopsis: typeof d.sinopsis === 'string' ? d.sinopsis : null,
+          genre: Array.isArray(d.genre)
+            ? (d.genre.filter((g) => g && typeof g === 'object') as Array<{
+                id: number;
+                nama: string;
+                slug: string;
+              }>)
+            : undefined,
+          tags: Array.isArray(d.tags)
+            ? d.tags.filter((t): t is string => typeof t === 'string')
+            : undefined,
+          url_dramabox: typeof d.url_dramabox === 'string' ? d.url_dramabox : 'https://www.dramaboxdb.com',
+          peringkat: typeof d.peringkat === 'number' ? d.peringkat : undefined,
+        };
+      };
+
+      let dramaDetail: DramaBoxParsedPayload['dramaDetail'] = null;
+      if (parsed.drama && typeof parsed.drama === 'object') {
+        const base = toDramaCard(parsed.drama);
+        if (base) {
+          const dObj = parsed.drama as Record<string, unknown>;
+          const pemeran = Array.isArray(dObj.pemeran)
+            ? dObj.pemeran.map(toPerformer).filter((p): p is DramaBoxPerformerCard => Boolean(p))
+            : undefined;
+          const bahasa_tersedia = Array.isArray(dObj.bahasa_tersedia)
+            ? dObj.bahasa_tersedia.filter((l): l is string => typeof l === 'string')
+            : undefined;
+          dramaDetail = { ...base, pemeran, bahasa_tersedia };
+        }
+      }
+
+      const dramaMap = new Map<string, DramaBoxDramaCard>();
+      const pushDramas = (arr: unknown) => {
+        if (!Array.isArray(arr)) return;
+        for (const item of arr) {
+          const card = toDramaCard(item);
+          if (card && !dramaMap.has(card.book_id)) {
+            dramaMap.set(card.book_id, card);
+          }
+        }
+      };
+
+      pushDramas(parsed.dramas);
+      pushDramas(parsed.rekomendasi);
+      if (Array.isArray(parsed.rak)) {
+        for (const shelf of parsed.rak) {
+          if (shelf && typeof shelf === 'object') {
+            pushDramas((shelf as Record<string, unknown>).items);
+          }
+        }
+      }
+      if (Array.isArray(parsed.channels)) {
+        for (const ch of parsed.channels) {
+          if (ch && typeof ch === 'object') {
+            pushDramas((ch as Record<string, unknown>).pratinjau);
+          }
+        }
+      }
+
+      const performerMap = new Map<string, DramaBoxPerformerCard>();
+      const pushPerformers = (arr: unknown) => {
+        if (!Array.isArray(arr)) return;
+        for (const item of arr) {
+          const card = toPerformer(item);
+          if (card && !performerMap.has(card.performer_id)) {
+            performerMap.set(card.performer_id, card);
+          }
+        }
+      };
+      if (parsed.performer) {
+        const single = toPerformer(parsed.performer);
+        if (single) performerMap.set(single.performer_id, single);
+      }
+      pushPerformers(parsed.performers);
+      pushPerformers(parsed.pemeran_populer);
+
+      const episodes: DramaBoxEpisodePreview[] = Array.isArray(parsed.episodes)
+        ? parsed.episodes
+            .filter((e): e is Record<string, unknown> => Boolean(e && typeof e === 'object'))
+            .map((e) => ({
+              episode_nomor: Number(e.episode_nomor),
+              judul_episode: typeof e.judul_episode === 'string' ? e.judul_episode : `Episode ${e.episode_nomor}`,
+              chapter_id: typeof e.chapter_id === 'string' ? e.chapter_id : null,
+              gratis_pembuka: typeof e.gratis_pembuka === 'boolean' ? e.gratis_pembuka : null,
+              url_dramabox: typeof e.url_dramabox === 'string' ? e.url_dramabox : 'https://www.dramaboxdb.com',
+            }))
+            .filter((e) => Number.isFinite(e.episode_nomor) && e.episode_nomor >= 1)
+        : [];
+
+      return {
+        layanan,
+        bahasa,
+        dramaDetail,
+        dramas: Array.from(dramaMap.values()),
+        performers: Array.from(performerMap.values()),
+        episodes,
+        totalEpisode: typeof parsed.total_episode === 'number' ? parsed.total_episode : undefined,
+      };
+    } catch {
+      return null;
+    }
+  }, [liveResponse, endpoint.category, endpoint.subGroup, endpoint.id, paramValues.lang]);
 
   const handleSelectPineDramaEpisode = async (episodeId: number) => {
     const existing = parsedPineDramaData?.episodes.find((ep) => ep.episode_id === episodeId);
@@ -940,6 +1123,25 @@ export function EndpointDocPage({
         <Info className="h-4 w-4 shrink-0 text-sky-500 dark:text-sky-400 mt-0.5" />
         <span className="min-w-0 break-words">{content.docsNotice}</span>
       </div>
+
+      {/* Per-Endpoint Custom Admin Notice */}
+      {(() => {
+        const endpointCustomNotice = (content.endpointNotices?.[endpoint.id] || '').trim();
+        if (!endpointCustomNotice) return null;
+        return (
+          <div className="mt-3 flex min-w-0 items-start gap-2.5 rounded-xl border border-amber-500/40 bg-amber-500/[0.08] px-4 py-3 text-xs leading-relaxed text-amber-950 dark:border-amber-400/35 dark:bg-amber-500/[0.11] dark:text-amber-100">
+            <Info className="h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400 mt-0.5" />
+            <div className="min-w-0 flex-1 space-y-0.5">
+              <div className="font-semibold text-amber-900 dark:text-amber-200">
+                Informasi Khusus Endpoint
+              </div>
+              <p className="whitespace-pre-line break-words text-amber-900/90 dark:text-amber-100/90">
+                {endpointCustomNotice}
+              </p>
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Auth & Daily Credit Status Strip */}
       <div className="mt-4 flex flex-wrap items-center justify-between gap-4 rounded-xl border border-slate-200/80 bg-transparent px-4 py-3.5 dark:border-white/[0.08]">
@@ -1382,6 +1584,11 @@ export function EndpointDocPage({
                 onSelectEpisode={handleSelectPineDramaEpisode}
                 onNavigate={onNavigate}
               />
+            )}
+
+            {/* Interactive DramaBox Short Drama & Performer Cards */}
+            {parsedDramaBoxData && (
+              <DramaBoxPanel payload={parsedDramaBoxData} onNavigate={onNavigate} />
             )}
 
             {/* Interactive Spotify Track Preview Cards (Play Full Song / Lyrics) */}

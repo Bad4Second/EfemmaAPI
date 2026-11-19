@@ -17,6 +17,7 @@ import {
   GripVertical,
   Home,
   ImagePlus,
+  Info,
   Layers,
   Lock,
   PencilLine,
@@ -255,7 +256,10 @@ export function AdminDashboardPage({
   const [contentErrorMsg, setContentErrorMsg] = useState('');
   const [imageErrorMsg, setImageErrorMsg] = useState('');
   const [apiFilterQuery, setApiFilterQuery] = useState('');
-  const [apiModeFilter, setApiModeFilter] = useState<'all' | 'public' | 'private' | 'hidden'>('all');
+  const [apiModeFilter, setApiModeFilter] = useState<
+    'all' | 'public' | 'private' | 'hidden' | 'has-info'
+  >('all');
+  const [openNoticeEndpointIds, setOpenNoticeEndpointIds] = useState<Record<string, boolean>>({});
   const [dragCategoryIdx, setDragCategoryIdx] = useState<number | null>(null);
   const [dragOverIdx, setDragOverIdx] = useState<number | null>(null);
 
@@ -402,12 +406,15 @@ export function AdminDashboardPage({
     const nextDeleted = Array.from(new Set([...draftContent.deletedEndpointIds, target.id]));
     const nextRoles = { ...draftContent.privateEndpointRoles };
     delete nextRoles[target.id];
+    const nextNotices = { ...(draftContent.endpointNotices ?? {}) };
+    delete nextNotices[target.id];
     const nextContent: SiteContent = {
       ...draftContent,
       deletedEndpointIds: nextDeleted,
       hiddenEndpointIds: draftContent.hiddenEndpointIds.filter((id) => id !== target.id),
       privateEndpointIds: draftContent.privateEndpointIds.filter((id) => id !== target.id),
       privateEndpointRoles: nextRoles,
+      endpointNotices: nextNotices,
     };
     try {
       setDraftContent(nextContent);
@@ -1098,6 +1105,9 @@ export function AdminDashboardPage({
                 onChange={(e) => setDraftContent((p) => ({ ...p, docsNotice: e.target.value }))}
                 className="mt-1.5 w-full rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-900 dark:border-white/10 dark:bg-[#0A0A0A] dark:text-white"
               />
+              <p className="mt-1 text-[11px] text-slate-500 dark:text-slate-400">
+                Pesan di atas tampil di seluruh halaman endpoint. Untuk menambahkan informasi khusus pada endpoint tertentu saja, gunakan tombol <strong>Info</strong> di tab <strong>Urutan &amp; Kontrol API</strong>.
+              </p>
             </div>
 
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-4">
@@ -1688,13 +1698,18 @@ export function AdminDashboardPage({
             const activeHiddenCount = activeEndpoints.filter((ep) =>
               draftContent.hiddenEndpointIds.includes(ep.id)
             ).length;
+            const activeInfoCount = activeEndpoints.filter(
+              (ep) => (draftContent.endpointNotices?.[ep.id] || '').trim().length > 0
+            ).length;
             const deletedCount = draftContent.deletedEndpointIds.length;
             const filteredEndpoints = activeEndpoints.filter((ep) => {
               const isPriv = draftContent.privateEndpointIds.includes(ep.id);
               const isHid = draftContent.hiddenEndpointIds.includes(ep.id);
+              const hasEpInfo = (draftContent.endpointNotices?.[ep.id] || '').trim().length > 0;
               if (apiModeFilter === 'public' && isPriv) return false;
               if (apiModeFilter === 'private' && !isPriv) return false;
               if (apiModeFilter === 'hidden' && !isHid) return false;
+              if (apiModeFilter === 'has-info' && !hasEpInfo) return false;
               const q = apiFilterQuery.trim().toLowerCase();
               if (!q) return true;
               return (
@@ -1721,7 +1736,7 @@ export function AdminDashboardPage({
                   )}
                 </div>
                 <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
-                  Ubah mode tiap endpoint antara <strong>Publik</strong> dan <strong>Privat</strong>, sembunyikan sementara, atau <strong>Hapus Permanen</strong> agar tidak dapat diakses lagi oleh siapapun.
+                  Ubah mode tiap endpoint antara <strong>Publik</strong> dan <strong>Privat</strong>, tambah teks <strong>Informasi</strong> khusus per endpoint, sembunyikan sementara, atau <strong>Hapus Permanen</strong>.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2">
@@ -1762,6 +1777,10 @@ export function AdminDashboardPage({
                   {
                     id: 'hidden',
                     label: `Tersembunyi (${activeHiddenCount})`,
+                  },
+                  {
+                    id: 'has-info',
+                    label: `Dengan Info (${activeInfoCount})`,
                   },
                 ] as const).map((f) => (
                   <button
@@ -1866,6 +1885,9 @@ export function AdminDashboardPage({
                   allowedRoles.length > 0
                     ? `ADMIN, ${allowedRoles.map((r) => r.toUpperCase()).join(', ')}`
                     : 'Hanya ADMIN';
+                const endpointNoticeText = draftContent.endpointNotices?.[ep.id] ?? '';
+                const hasNotice = endpointNoticeText.trim().length > 0;
+                const isNoticeOpen = openNoticeEndpointIds[ep.id] ?? false;
 
                 return (
                   <div
@@ -1890,6 +1912,12 @@ export function AdminDashboardPage({
                             <span className="inline-flex items-center gap-1 rounded border border-sky-500/30 bg-sky-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-sky-700 dark:text-sky-300">
                               <Globe className="h-2.5 w-2.5 shrink-0" />
                               <span>Publik</span>
+                            </span>
+                          )}
+                          {hasNotice && (
+                            <span className="inline-flex items-center gap-1 rounded border border-sky-500/35 bg-sky-500/10 px-1.5 py-0.5 font-mono text-[10px] font-semibold text-sky-700 dark:text-sky-300">
+                              <Info className="h-2.5 w-2.5 shrink-0" />
+                              <span>Ada Info</span>
                             </span>
                           )}
                         </div>
@@ -1968,6 +1996,25 @@ export function AdminDashboardPage({
 
                         <button
                           type="button"
+                          onClick={() =>
+                            setOpenNoticeEndpointIds((prev) => ({
+                              ...prev,
+                              [ep.id]: !isNoticeOpen,
+                            }))
+                          }
+                          title="Tambah atau edit teks informasi khusus pada endpoint ini"
+                          className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                            hasNotice || isNoticeOpen
+                              ? 'border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300'
+                              : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50 dark:border-white/10 dark:bg-[#0A0A0A] dark:text-slate-300 dark:hover:bg-white/10'
+                          }`}
+                        >
+                          <Info className="h-3.5 w-3.5" />
+                          <span>{hasNotice ? 'Edit Info' : 'Info'}</span>
+                        </button>
+
+                        <button
+                          type="button"
                           onClick={() => setDeleteTargetEndpoint(ep)}
                           title="Hapus permanen endpoint ini agar tidak dapat diakses lagi oleh siapapun"
                           className="inline-flex items-center gap-1.5 rounded-lg border border-rose-500/35 bg-rose-500/10 px-3 py-1.5 text-xs font-medium text-rose-700 transition-colors hover:bg-rose-500/20 dark:text-rose-300 cursor-pointer"
@@ -1977,6 +2024,63 @@ export function AdminDashboardPage({
                         </button>
                       </div>
                     </div>
+
+                    {isNoticeOpen && (
+                      <div className="rounded-lg border border-sky-500/25 bg-sky-500/[0.05] px-3 py-2.5 space-y-2 min-w-0 max-w-full">
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <label
+                            htmlFor={`endpoint-notice-${ep.id}`}
+                            className="inline-flex items-center gap-1.5 text-[11px] font-semibold text-sky-800 dark:text-sky-200"
+                          >
+                            <Info className="h-3.5 w-3.5 shrink-0 text-sky-500 dark:text-sky-400" />
+                            <span>Informasi Khusus Endpoint ({ep.title})</span>
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono text-[10px] text-slate-500 dark:text-slate-400 tabular-nums">
+                              {endpointNoticeText.length}/1000
+                            </span>
+                            {endpointNoticeText.length > 0 && (
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setDraftContent((p) => {
+                                    const next = { ...(p.endpointNotices ?? {}) };
+                                    delete next[ep.id];
+                                    return { ...p, endpointNotices: next };
+                                  })
+                                }
+                                className="rounded border border-rose-500/30 bg-rose-500/10 px-2 py-0.5 text-[10px] font-medium text-rose-700 hover:bg-rose-500/20 dark:text-rose-300 cursor-pointer"
+                              >
+                                Kosongkan
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                        <textarea
+                          id={`endpoint-notice-${ep.id}`}
+                          rows={3}
+                          maxLength={1000}
+                          value={endpointNoticeText}
+                          onChange={(e) => {
+                            const nextVal = e.target.value;
+                            setDraftContent((p) => {
+                              const next = { ...(p.endpointNotices ?? {}) };
+                              if (!nextVal) {
+                                delete next[ep.id];
+                              } else {
+                                next[ep.id] = nextVal;
+                              }
+                              return { ...p, endpointNotices: next };
+                            });
+                          }}
+                          placeholder="Tulis catatan, pengumuman, format parameter, atau peringatan khusus yang akan muncul di halaman dokumentasi endpoint ini..."
+                          className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs text-slate-900 placeholder:text-slate-400 dark:border-white/10 dark:bg-[#0A0A0A] dark:text-white"
+                        />
+                        <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                          Klik <strong>Simpan Pengaturan API</strong> atau <strong>Simpan Visibilitas API</strong> untuk menerbitkan teks informasi ini.
+                        </p>
+                      </div>
+                    )}
 
                     {isPrivate && (
                       <div className="flex flex-wrap items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/[0.05] px-3 py-2 min-w-0 max-w-full">

@@ -325,6 +325,22 @@ function sanitizeSiteContent(raw: unknown): SiteContent {
       }
       return out;
     })(),
+    endpointNotices: (() => {
+      const out: Record<string, string> = {};
+      if (d.endpointNotices && typeof d.endpointNotices === 'object' && !Array.isArray(d.endpointNotices)) {
+        for (const [k, v] of Object.entries(d.endpointNotices as Record<string, unknown>).slice(
+          0,
+          100
+        )) {
+          if (typeof k !== 'string' || typeof v !== 'string') continue;
+          const cleanId = k.trim();
+          const cleanText = v.trim().slice(0, 1000);
+          if (!cleanId || !/^[a-zA-Z0-9_-]{1,64}$/.test(cleanId) || !cleanText) continue;
+          out[cleanId] = cleanText;
+        }
+      }
+      return out;
+    })(),
     hubCsLabel: clampNonEmptyString(d.hubCsLabel, def.hubCsLabel, 40),
     hubFaqLabel: clampNonEmptyString(d.hubFaqLabel, def.hubFaqLabel, 40),
     hubSosmedLabel: clampNonEmptyString(d.hubSosmedLabel, def.hubSosmedLabel, 40),
