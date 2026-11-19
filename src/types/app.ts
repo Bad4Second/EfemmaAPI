@@ -177,7 +177,7 @@ export interface SiteContent {
   publicChatCtaUrl: string;
 }
 
-export const DEFAULT_CATEGORY_ORDER = ['cuaca', 'kurs', 'integrasi', 'spotify'];
+export const DEFAULT_CATEGORY_ORDER = ['cuaca', 'kurs', 'integrasi', 'spotify', 'streaming'];
 
 export const DEFAULT_SITE_CONTENT: SiteContent = {
   brandName: 'EfemmaAPI',

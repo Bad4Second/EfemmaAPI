@@ -21,6 +21,11 @@ import {
 } from 'lucide-react';
 import { ActiveFullSongTrack, SpotifyPlayerPanel } from '../components/SpotifyPlayerPanel';
 import {
+  PineDramaEpisodeItem,
+  PineDramaPanel,
+  PineDramaParsedPayload,
+} from '../components/PineDramaPanel';
+import {
   API_ENDPOINTS,
   ApiEndpointSpec,
   buildPostBody,
@@ -118,6 +123,11 @@ export function EndpointDocPage({
   const [keyError, setKeyError] = useState('');
   const [playbackPosMs, setPlaybackPosMs] = useState(0);
   const [activeFullSong, setActiveFullSong] = useState<ActiveFullSongTrack | null>(null);
+  const [activePineEpisodeId, setActivePineEpisodeId] = useState<number | null>(null);
+  const [loadingPineEpisodeId, setLoadingPineEpisodeId] = useState<number | null>(null);
+  const [pineExtraEpisodes, setPineExtraEpisodes] = useState<Record<number, PineDramaEpisodeItem>>(
+    {}
+  );
   const blobUrlRef = useRef<string | null>(null);
 
   useEffect(() => {
@@ -139,10 +149,28 @@ export function EndpointDocPage({
       sessionStorage.removeItem('efemma_pending_episode_id');
       sessionStorage.removeItem('efemma_pending_episode_target');
     }
+    const pendingPineSlug = sessionStorage.getItem('efemma_pending_pinedrama_slug');
+    const pendingPineLang = sessionStorage.getItem('efemma_pending_pinedrama_lang');
+    const pendingPineTarget = sessionStorage.getItem('efemma_pending_pinedrama_target');
+    if (pendingPineSlug && pendingPineTarget === endpoint.id) {
+      initial.slug = pendingPineSlug;
+      if (pendingPineLang && 'lang' in initial) {
+        initial.lang = pendingPineLang;
+      }
+      if ('episode_id' in initial) {
+        initial.episode_id = '';
+      }
+      sessionStorage.removeItem('efemma_pending_pinedrama_slug');
+      sessionStorage.removeItem('efemma_pending_pinedrama_lang');
+      sessionStorage.removeItem('efemma_pending_pinedrama_target');
+    }
     setParamValues(initial);
     setLiveResponse(null);
     setResponseTab('body');
     setKeyError('');
+    setActivePineEpisodeId(null);
+    setLoadingPineEpisodeId(null);
+    setPineExtraEpisodes({});
   }, [endpoint]);
 
   useEffect(() => {
@@ -252,6 +280,8 @@ export function EndpointDocPage({
       return;
     }
     setKeyError('');
+    setActivePineEpisodeId(null);
+    setPineExtraEpisodes({});
 
     setLoading(true);
     const start = performance.now();
@@ -539,6 +569,202 @@ export function EndpointDocPage({
     }
   }, [liveResponse, endpoint.category]);
 
+  const parsedPineDramaData = useMemo<PineDramaParsedPayload | null>(() => {
+    if (!liveResponse || liveResponse.isError || endpoint.category !== 'streaming') {
+      return null;
+    }
+    try {
+      const parsed = JSON.parse(liveResponse.bodyText) as Record<string, unknown>;
+      if (!parsed.sukses) return null;
+
+      const layanan =
+        typeof parsed.layanan === 'string' && parsed.layanan ? parsed.layanan : endpoint.id;
+      const bahasa =
+        typeof parsed.bahasa === 'string' && parsed.bahasa
+          ? parsed.bahasa
+          : paramValues.lang || 'en';
+
+      const dramaRaw =
+        parsed.drama && typeof parsed.drama === 'object'
+          ? (parsed.drama as Record<string, unknown>)
+          : null;
+
+      const dramaDetail = dramaRaw
+        ? {
+            slug: String(dramaRaw.slug || ''),
+            judul: String(dramaRaw.judul || dramaRaw.slug || ''),
+            sampul: typeof dramaRaw.sampul === 'string' ? dramaRaw.sampul : null,
+            rating: typeof dramaRaw.rating === 'string' ? dramaRaw.rating : null,
+            jumlah_episode:
+              typeof dramaRaw.jumlah_episode === 'number' ? dramaRaw.jumlah_episode : null,
+            sinopsis: typeof dramaRaw.sinopsis === 'string' ? dramaRaw.sinopsis : null,
+          }
+        : null;
+
+      const dramaMap = new Map<string, PineDramaParsedPayload['dramas'][number]>();
+      const pushDramas = (arr: unknown) => {
+        if (!Array.isArray(arr)) return;
+        for (const item of arr) {
+          if (!item || typeof item !== 'object') continue;
+          const obj = item as Record<string, unknown>;
+          const slug = typeof obj.slug === 'string' ? obj.slug : '';
+          if (!slug || dramaMap.has(slug)) continue;
+          dramaMap.set(slug, {
+            slug,
+            judul: String(obj.judul || slug),
+            sampul: typeof obj.sampul === 'string' ? obj.sampul : null,
+            rating: typeof obj.rating === 'string' ? obj.rating : null,
+            jumlah_episode:
+              typeof obj.jumlah_episode === 'number' ? obj.jumlah_episode : null,
+            sinopsis: typeof obj.sinopsis === 'string' ? obj.sinopsis : null,
+          });
+        }
+      };
+
+      pushDramas(parsed.dramas);
+      pushDramas(parsed.rekomendasi_for_you);
+      pushDramas(parsed.rekomendasi_trending);
+
+      const semuaEpisodeRaw = Array.isArray(parsed.semua_episode)
+        ? parsed.semua_episode
+        : dramaRaw && Array.isArray(dramaRaw.episode_web)
+        ? dramaRaw.episode_web
+        : [];
+      const semuaEpisode = semuaEpisodeRaw
+        .filter((e): e is Record<string, unknown> => Boolean(e && typeof e === 'object'))
+        .map((e) => ({
+          episode_id: Number(e.episode_id),
+          dapat_diputar: Boolean(e.dapat_diputar),
+        }))
+        .filter((e) => Number.isFinite(e.episode_id) && e.episode_id >= 1)
+        .sort((a, b) => a.episode_id - b.episode_id);
+
+      const epMap = new Map<number, PineDramaEpisodeItem>();
+      if (Array.isArray(parsed.episodes)) {
+        for (const item of parsed.episodes) {
+          if (!item || typeof item !== 'object') continue;
+          const obj = item as Record<string, unknown>;
+          const epId = Number(obj.episode_id);
+          if (!Number.isFinite(epId)) continue;
+          epMap.set(epId, {
+            episode_id: epId,
+            dapat_diputar: Boolean(obj.dapat_diputar),
+            judul_episode: typeof obj.judul_episode === 'string' ? obj.judul_episode : null,
+            stream_url: typeof obj.stream_url === 'string' ? obj.stream_url : null,
+            relative_stream_url:
+              typeof obj.relative_stream_url === 'string' ? obj.relative_stream_url : null,
+            source_cdn_url:
+              typeof obj.source_cdn_url === 'string' ? obj.source_cdn_url : null,
+            status_stream: typeof obj.status_stream === 'string' ? obj.status_stream : undefined,
+            pesan_server: typeof obj.pesan_server === 'string' ? obj.pesan_server : undefined,
+          });
+        }
+      }
+      for (const extraEp of Object.values(pineExtraEpisodes)) {
+        const prev = epMap.get(extraEp.episode_id);
+        if (!prev || (!prev.stream_url && extraEp.stream_url)) {
+          epMap.set(extraEp.episode_id, extraEp);
+        }
+      }
+
+      const episodes = Array.from(epMap.values()).sort((a, b) => a.episode_id - b.episode_id);
+
+      return {
+        layanan,
+        bahasa,
+        dramaDetail,
+        dramas: Array.from(dramaMap.values()),
+        totalEpisodeSerial:
+          typeof parsed.total_episode_serial === 'number'
+            ? parsed.total_episode_serial
+            : dramaDetail?.jumlah_episode ?? undefined,
+        totalPlayableWeb:
+          typeof parsed.total_playable_web === 'number'
+            ? parsed.total_playable_web
+            : typeof dramaRaw?.jumlah_episode_playable === 'number'
+            ? dramaRaw.jumlah_episode_playable
+            : undefined,
+        semuaEpisode,
+        episodes,
+      };
+    } catch {
+      return null;
+    }
+  }, [liveResponse, endpoint.category, endpoint.id, paramValues.lang, pineExtraEpisodes]);
+
+  const handleSelectPineDramaEpisode = async (episodeId: number) => {
+    const existing = parsedPineDramaData?.episodes.find((ep) => ep.episode_id === episodeId);
+    if (existing?.stream_url) {
+      setActivePineEpisodeId(episodeId);
+      return;
+    }
+
+    if (!userProfile || !auth.currentUser) {
+      onLoginGoogle();
+      return;
+    }
+
+    const trimmedKey = apiKeyInput.trim();
+    if (!trimmedKey) {
+      setKeyError('Masukkan API Key Anda sebelum memutar episode.');
+      return;
+    }
+
+    const activeSlug = parsedPineDramaData?.dramaDetail?.slug || paramValues.slug || '';
+    const activeLang = parsedPineDramaData?.bahasa || paramValues.lang || 'en';
+    if (!activeSlug) return;
+
+    setLoadingPineEpisodeId(episodeId);
+    const start = performance.now();
+    try {
+      const idToken = await auth.currentUser.getIdToken();
+      const targetUrl = `/api/v1/streaming/pinedrama/get-episodes?slug=${encodeURIComponent(
+        activeSlug
+      )}&lang=${encodeURIComponent(activeLang)}&episode_id=${encodeURIComponent(
+        String(episodeId)
+      )}`;
+      const res = await fetch(targetUrl, {
+        headers: {
+          Accept: 'application/json',
+          Authorization: `Bearer ${idToken}`,
+          'x-efemma-key': trimmedKey,
+        },
+      });
+      const elapsed = Math.round(performance.now() - start);
+      const json = (await res.json()) as {
+        sukses?: boolean;
+        episodes?: PineDramaEpisodeItem[];
+        kesalahan?: { pesan?: string };
+      };
+
+      if (res.ok && json.sukses && Array.isArray(json.episodes) && json.episodes.length > 0) {
+        const fetchedEp = json.episodes[0];
+        setPineExtraEpisodes((prev) => ({ ...prev, [episodeId]: fetchedEp }));
+        setActivePineEpisodeId(episodeId);
+        await Promise.allSettled([
+          onRefreshUserProfile(),
+          onRecordUsageLog({
+            endpointId: endpoint.id,
+            method: 'GET',
+            path: endpoint.path,
+            status: res.status,
+            latencyMs: elapsed,
+          }),
+        ]);
+      } else {
+        setKeyError(
+          json.kesalahan?.pesan || `Gagal memuat link video untuk Episode ${episodeId}.`
+        );
+      }
+    } catch (err) {
+      setKeyError(
+        err instanceof Error ? err.message : `Gagal memuat link video Episode ${episodeId}.`
+      );
+    } finally {
+      setLoadingPineEpisodeId(null);
+    }
+  };
+
   const isEndpointHidden =
     content.hiddenCategories.includes(endpoint.category) ||
     content.hiddenEndpointIds.includes(endpoint.id);
@@ -647,6 +873,12 @@ export function EndpointDocPage({
         </button>
         <span aria-hidden="true">/</span>
         <span>{endpoint.categoryLabel}</span>
+        {endpoint.subGroup && (
+          <>
+            <span aria-hidden="true">/</span>
+            <span>{endpoint.subGroup}</span>
+          </>
+        )}
         <span aria-hidden="true">/</span>
         <span className="font-medium text-slate-900 dark:text-slate-200">{endpoint.title}</span>
       </nav>
@@ -1139,6 +1371,17 @@ export function EndpointDocPage({
               <pre className="mt-3 max-h-[380px] w-full max-w-full overflow-auto rounded-xl border border-slate-200 bg-slate-950 p-4 font-mono text-xs leading-relaxed text-slate-100 dark:border-white/10 dark:bg-[#111111]">
                 <code>{displayedJson}</code>
               </pre>
+            )}
+
+            {/* Interactive PineDrama Video Player & Drama Cards */}
+            {parsedPineDramaData && (
+              <PineDramaPanel
+                payload={parsedPineDramaData}
+                activeEpisodeId={activePineEpisodeId}
+                loadingEpisodeId={loadingPineEpisodeId}
+                onSelectEpisode={handleSelectPineDramaEpisode}
+                onNavigate={onNavigate}
+              />
             )}
 
             {/* Interactive Spotify Track Preview Cards (Play Full Song / Lyrics) */}

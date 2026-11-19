@@ -1,6 +1,7 @@
 import express, { type Request, type Response, type NextFunction } from 'express';
 import { execFile } from 'node:child_process';
 import crypto from 'node:crypto';
+import dns from 'node:dns';
 import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
@@ -13,6 +14,7 @@ import dotenv from 'dotenv';
 const execFileAsync = promisify(execFile);
 
 dotenv.config();
+dns.setDefaultResultOrder('ipv4first');
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -88,6 +90,11 @@ const PATH_TO_ENDPOINT_ID: Record<string, string> = {
   '/spotify/play': 'spotify-play',
   '/spotify/podcast-play': 'spotify-podcast-play',
   '/spotify/lirik': 'spotify-lirik',
+  '/streaming/pinedrama/for-you': 'pinedrama-for-you',
+  '/streaming/pinedrama/trending': 'pinedrama-trending',
+  '/streaming/pinedrama/search': 'pinedrama-search',
+  '/streaming/pinedrama/detail': 'pinedrama-detail',
+  '/streaming/pinedrama/get-episodes': 'pinedrama-get-episodes',
 };
 
 function normalizeServerRoleKey(raw: string): string {
@@ -223,34 +230,91 @@ function getJakartaDateString(): string {
   }).format(new Date());
 }
 
+interface VerifiedTokenEntry {
+  uid: string;
+  email: string;
+  emailVerified: boolean;
+  cacheUntil: number;
+}
+
+const verifiedTokenCache = new Map<string, VerifiedTokenEntry>();
+const tokenVerifyInFlight = new Map<
+  string,
+  Promise<{ uid: string; email: string; emailVerified: boolean } | null>
+>();
+
+function getJwtExpMs(token: string): number {
+  try {
+    const parts = token.split('.');
+    if (parts.length !== 3) return 0;
+    const json = Buffer.from(parts[1], 'base64url').toString('utf8');
+    const payload = JSON.parse(json) as { exp?: number };
+    return typeof payload.exp === 'number' && Number.isFinite(payload.exp) ? payload.exp * 1000 : 0;
+  } catch {
+    return 0;
+  }
+}
+
 async function verifyFirebaseIdToken(
   idToken: string
 ): Promise<{ uid: string; email: string; emailVerified: boolean } | null> {
-  try {
-    const res = await fetch(
-      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
-        firebaseConfig.apiKey
-      )}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ idToken }),
-      }
-    );
-    if (!res.ok) return null;
-    const data = (await res.json()) as {
-      users?: Array<{ localId: string; email?: string; emailVerified?: boolean }>;
-    };
-    const user = data.users?.[0];
-    if (!user?.localId) return null;
+  const tokenHash = crypto.createHash('sha256').update(idToken).digest('hex');
+  const now = Date.now();
+  const cached = verifiedTokenCache.get(tokenHash);
+  if (cached && now < cached.cacheUntil) {
     return {
-      uid: user.localId,
-      email: (user.email || '').toLowerCase(),
-      emailVerified: Boolean(user.emailVerified),
+      uid: cached.uid,
+      email: cached.email,
+      emailVerified: cached.emailVerified,
     };
-  } catch {
-    return null;
   }
+
+  const inflight = tokenVerifyInFlight.get(tokenHash);
+  if (inflight) return inflight;
+
+  const task = (async () => {
+    try {
+      const res = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(
+          firebaseConfig.apiKey
+        )}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      if (!res.ok) return null;
+      const data = (await res.json()) as {
+        users?: Array<{ localId: string; email?: string; emailVerified?: boolean }>;
+      };
+      const user = data.users?.[0];
+      if (!user?.localId) return null;
+      const resolved = {
+        uid: user.localId,
+        email: (user.email || '').toLowerCase(),
+        emailVerified: Boolean(user.emailVerified),
+      };
+      const expMs = getJwtExpMs(idToken);
+      const cacheUntil =
+        expMs > 0 ? Math.min(Date.now() + 30_000, expMs - 2_000) : Date.now() + 20_000;
+      if (cacheUntil > Date.now()) {
+        if (verifiedTokenCache.size > 500) {
+          const oldestKey = verifiedTokenCache.keys().next().value;
+          if (oldestKey) verifiedTokenCache.delete(oldestKey);
+        }
+        verifiedTokenCache.set(tokenHash, { ...resolved, cacheUntil });
+      }
+      return resolved;
+    } catch {
+      return null;
+    } finally {
+      tokenVerifyInFlight.delete(tokenHash);
+    }
+  })();
+
+  tokenVerifyInFlight.set(tokenHash, task);
+  return task;
 }
 
 interface FirestoreUserFields {
@@ -685,6 +749,7 @@ async function createServer() {
     if (seg === 'kurs') return 'kurs';
     if (seg === 'integrasi') return 'integrasi';
     if (seg === 'spotify') return 'spotify';
+    if (seg === 'streaming') return 'streaming';
     return seg;
   }
 
@@ -792,6 +857,57 @@ async function createServer() {
       mp3_stream_url: `${baseOrigin}${relativeMp3}`,
       relative_stream_url: relativeM4a,
       relative_mp3_stream_url: relativeMp3,
+    };
+  }
+
+  function isAllowedPineDramaVideoUrl(rawUrl: string): boolean {
+    try {
+      const u = new URL(rawUrl);
+      if (u.protocol !== 'https:') return false;
+      const host = u.hostname.toLowerCase();
+      return (
+        host === 'pinedrama.com' ||
+        host.endsWith('.pinedrama.com') ||
+        host === 'minishort.com' ||
+        host.endsWith('.minishort.com')
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function signPineDramaVideoToken(src: string, exp: string): string {
+    return crypto
+      .createHmac('sha256', AUDIO_STREAM_SECRET)
+      .update(`pinedrama-video|${src}|${exp}`)
+      .digest('hex');
+  }
+
+  function verifyPineDramaVideoToken(src: string, exp: string, sig: string): boolean {
+    if (!isAllowedPineDramaVideoUrl(src)) return false;
+    const expNum = Number(exp);
+    if (!Number.isFinite(expNum) || expNum <= Date.now()) return false;
+    const expected = signPineDramaVideoToken(src, exp);
+    const a = Buffer.from(expected, 'utf8');
+    const b = Buffer.from(sig, 'utf8');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  }
+
+  function buildSignedPineDramaVideoUrls(req: Request, rawMp4Url: string) {
+    const exp = String(Date.now() + 6 * 3600_000);
+    const sig = signPineDramaVideoToken(rawMp4Url, exp);
+    const qs = new URLSearchParams({
+      src: rawMp4Url,
+      exp,
+      sig,
+    });
+    const relativeUrl = `/api/v1/streaming/pinedrama/video?${qs.toString()}`;
+    const baseOrigin = `${req.protocol}://${req.get('host')}`;
+    return {
+      stream_url: `${baseOrigin}${relativeUrl}`,
+      relative_stream_url: relativeUrl,
+      source_cdn_url: rawMp4Url,
     };
   }
 
@@ -1056,6 +1172,11 @@ async function createServer() {
       { metode: 'POST', jalur: '/api/v1/spotify/play', kategori: 'spotify' },
       { metode: 'GET', jalur: '/api/v1/spotify/podcast-play', kategori: 'spotify' },
       { metode: 'GET', jalur: '/api/v1/spotify/lirik', kategori: 'spotify' },
+      { metode: 'GET', jalur: '/api/v1/streaming/pinedrama/for-you', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/pinedrama/trending', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/pinedrama/search', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/pinedrama/detail', kategori: 'streaming' },
+      { metode: 'GET', jalur: '/api/v1/streaming/pinedrama/get-episodes', kategori: 'streaming' },
     ];
     const activeEndpoints = allEndpoints.filter((ep) => {
       const subPath = ep.jalur.replace(/^\/api\/v1/, '');
@@ -1093,7 +1214,10 @@ async function createServer() {
       recordEndpointLatency(req.method, normalizedEndpointPath, res.statusCode, elapsedMs);
     });
 
-    const siteRules = await getSiteAccessRules();
+    const [siteRules, preVerifiedToken] = await Promise.all([
+      getSiteAccessRules(),
+      idToken ? verifyFirebaseIdToken(idToken) : Promise.resolve(null),
+    ]);
     const endpointId = PATH_TO_ENDPOINT_ID[req.path];
     if (endpointId && siteRules.deletedEndpointIds.has(endpointId)) {
       return res.status(410).json({
@@ -1132,6 +1256,35 @@ async function createServer() {
       }
     }
 
+    // Allow signed video stream URLs issued by /api/v1/streaming/pinedrama/get-episodes
+    if (
+      req.method === 'GET' &&
+      req.path === '/streaming/pinedrama/video' &&
+      typeof req.query.src === 'string' &&
+      typeof req.query.exp === 'string' &&
+      typeof req.query.sig === 'string'
+    ) {
+      if (siteRules.deletedEndpointIds.has('pinedrama-get-episodes')) {
+        return res.status(410).json({
+          sukses: false,
+          kesalahan: {
+            kode: 'ENDPOINT_DIHAPUS',
+            pesan: 'Endpoint ini telah dihapus secara permanen oleh Administrator dan tidak dapat diakses oleh siapapun lagi.',
+          },
+        });
+      }
+      if (
+        verifyPineDramaVideoToken(
+          String(req.query.src),
+          String(req.query.exp),
+          String(req.query.sig)
+        )
+      ) {
+        res.setHeader('X-Auth-Mode', 'signed-video-stream');
+        return next();
+      }
+    }
+
     const originalJson = res.json.bind(res);
     res.json = ((body: unknown) => {
       const elapsedMs = Number(process.hrtime.bigint() - startHr) / 1_000_000;
@@ -1148,7 +1301,7 @@ async function createServer() {
 
       // Path A: Browser Playground or authenticated client with Firebase Bearer token
       if (idToken) {
-        const verified = await verifyFirebaseIdToken(idToken);
+        const verified = preVerifiedToken;
         if (!verified) {
           return res.status(401).json({
             sukses: false,
@@ -1282,18 +1435,22 @@ async function createServer() {
         }
 
         const nextUsed = usedToday + 1;
-        const updated = await incrementCreditInFirestore(verified.uid, idToken, nextUsed, today);
-        if (!updated && !isUnlimited) {
-          res.setHeader('X-Credits-Limit', String(dailyLimit));
-          res.setHeader('X-Credits-Used', String(usedToday));
-          res.setHeader('X-Credits-Remaining', '0');
-          return res.status(429).json({
-            sukses: false,
-            kesalahan: {
-              kode: 'KUOTA_HARIAN_HABIS',
-              pesan: 'Permintaan ditolak oleh pembatasan kuota harian.',
-            },
-          });
+        if (isUnlimited) {
+          void incrementCreditInFirestore(verified.uid, idToken, nextUsed, today);
+        } else {
+          const updated = await incrementCreditInFirestore(verified.uid, idToken, nextUsed, today);
+          if (!updated) {
+            res.setHeader('X-Credits-Limit', String(dailyLimit));
+            res.setHeader('X-Credits-Used', String(usedToday));
+            res.setHeader('X-Credits-Remaining', '0');
+            return res.status(429).json({
+              sukses: false,
+              kesalahan: {
+                kode: 'KUOTA_HARIAN_HABIS',
+                pesan: 'Permintaan ditolak oleh pembatasan kuota harian.',
+              },
+            });
+          }
         }
 
         // Sync cache
@@ -5266,6 +5423,1285 @@ async function createServer() {
     } catch (err) {
       return sendSpotifyScrapeError(res, err);
     }
+  });
+
+  // ============================================================================
+  // Streaming > PineDrama Live Scraping & API Endpoints
+  // ============================================================================
+
+  const PINEDRAMA_SUPPORTED_LANGS = new Set(['en', 'id', 'es', 'pt', 'th', 'ru']);
+
+  interface PineTtlEntry<T> {
+    value: T;
+    expiresAt: number;
+  }
+
+  const pineHtmlCache = new Map<string, PineTtlEntry<{ status: number; text: string }>>();
+  const pineDetailCache = new Map<string, PineTtlEntry<Awaited<ReturnType<typeof scrapePineDramaDetailFresh>> | null>>();
+  const pineSearchCache = new Map<string, PineTtlEntry<unknown>>();
+  const pinePlayUrlCache = new Map<
+    string,
+    PineTtlEntry<{ stream_url: string | null; status_stream: string; pesan_server: string }>
+  >();
+  const pineInFlight = new Map<string, Promise<unknown>>();
+
+  function pineCacheGet<T>(cache: Map<string, PineTtlEntry<T>>, key: string): T | undefined {
+    const entry = cache.get(key);
+    if (!entry) return undefined;
+    if (Date.now() >= entry.expiresAt) {
+      cache.delete(key);
+      return undefined;
+    }
+    return entry.value;
+  }
+
+  function pineCacheSet<T>(
+    cache: Map<string, PineTtlEntry<T>>,
+    key: string,
+    value: T,
+    ttlMs: number
+  ): void {
+    if (cache.size >= 250) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey) cache.delete(oldestKey);
+    }
+    cache.set(key, { value, expiresAt: Date.now() + ttlMs });
+  }
+
+  function withPineInFlight<T>(flightKey: string, factory: () => Promise<T>): Promise<T> {
+    const existing = pineInFlight.get(flightKey);
+    if (existing) return existing as Promise<T>;
+    const promise = factory().finally(() => {
+      pineInFlight.delete(flightKey);
+    });
+    pineInFlight.set(flightKey, promise);
+    return promise;
+  }
+
+  function normalizePineDramaLang(raw: unknown): string {
+    const clean = String(raw || '').trim().toLowerCase();
+    return PINEDRAMA_SUPPORTED_LANGS.has(clean) ? clean : 'en';
+  }
+
+  function buildPineDramaUrl(lang: string, subPath: string): string {
+    const prefix = lang && lang !== 'en' ? `/${lang}` : '';
+    return `https://pinedrama.com${prefix}${subPath}`;
+  }
+
+  function parsePineDramaSlugInput(
+    rawInput: unknown,
+    fallbackLang: string
+  ): { slug: string; detectedLang: string } {
+    const raw = String(rawInput || '').trim();
+    if (!raw) return { slug: '', detectedLang: fallbackLang };
+
+    let slugCandidate = raw;
+    let detectedLang = fallbackLang;
+
+    if (/^https?:\/\//i.test(raw) || raw.includes('/dramas/')) {
+      try {
+        const u = new URL(
+          raw.startsWith('http') ? raw : `https://pinedrama.com${raw.startsWith('/') ? '' : '/'}${raw}`
+        );
+        const parts = u.pathname.split('/').filter(Boolean);
+        const dramaIdx = parts.indexOf('dramas');
+        if (dramaIdx !== -1 && parts[dramaIdx + 1]) {
+          slugCandidate = parts[dramaIdx + 1];
+          if (dramaIdx === 1 && PINEDRAMA_SUPPORTED_LANGS.has(parts[0].toLowerCase())) {
+            detectedLang = parts[0].toLowerCase();
+          }
+        }
+      } catch {
+        // Fallback below
+      }
+    }
+
+    const cleanSlug = decodeURIComponent(slugCandidate)
+      .trim()
+      .toLowerCase()
+      .replace(/^\/+|\/+$/g, '');
+    return { slug: cleanSlug, detectedLang };
+  }
+
+  async function fetchPineDramaText(
+    url: string,
+    timeoutMs = 15_000
+  ): Promise<{ status: number; text: string }> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, {
+          signal: controller.signal,
+          headers: {
+            'User-Agent': SCRAPE_UA,
+            Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9,id;q=0.8',
+            Referer: 'https://pinedrama.com/',
+          },
+          redirect: 'follow',
+        });
+        const text = await response.text();
+        if (response.status >= 500 && attempt === 0) {
+          lastError = new Error(`PineDrama HTML HTTP ${response.status}`);
+          continue;
+        }
+        return { status: response.status, text };
+      } catch (err) {
+        lastError = err;
+        if (attempt === 1) throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Gagal mengambil halaman PineDrama.');
+  }
+
+  async function fetchPineDramaTextCached(
+    url: string,
+    ttlMs = 180_000,
+    timeoutMs = 15_000
+  ): Promise<{ status: number; text: string }> {
+    const cached = pineCacheGet(pineHtmlCache, url);
+    if (cached) return cached;
+    return withPineInFlight(`html:${url}`, async () => {
+      const res = await fetchPineDramaText(url, timeoutMs);
+      if (res.status >= 200 && res.status < 400 && res.text.length > 500) {
+        pineCacheSet(pineHtmlCache, url, res, ttlMs);
+      }
+      return res;
+    });
+  }
+
+  async function fetchPineDramaApiJson<T>(url: string, timeoutMs = 15_000): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch(url, {
+          signal: controller.signal,
+          headers: {
+            'User-Agent': SCRAPE_UA,
+            Accept: 'application/json, text/plain, */*',
+            Referer: 'https://pinedrama.com/',
+          },
+        });
+        if (!response.ok) {
+          if (response.status >= 500 && attempt === 0) {
+            lastError = new Error(`PineDrama API mengembalikan HTTP ${response.status}.`);
+            continue;
+          }
+          throw new Error(`PineDrama API mengembalikan HTTP ${response.status}.`);
+        }
+        return (await response.json()) as T;
+      } catch (err) {
+        lastError = err;
+        if (attempt === 1) throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error('Gagal menghubungi API PineDrama.');
+  }
+
+  interface PineDramaRscPayload {
+    joined: string;
+    lineMap: Map<string, string>;
+  }
+
+  function extractPineDramaRsc(html: string): PineDramaRscPayload {
+    const chunks: string[] = [];
+    const re = /self\.__next_f\.push\(\[\d+,"((?:\\.|[^"\\])*)"\]\)/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(html))) {
+      try {
+        chunks.push(JSON.parse(`"${m[1]}"`) as string);
+      } catch {
+        // Skip malformed chunk
+      }
+    }
+    const lineMap = new Map<string, string>();
+    for (const chunk of chunks) {
+      for (const line of chunk.split('\n')) {
+        const lm = line.match(/^([0-9a-f]+):(.*)$/);
+        if (lm) {
+          lineMap.set(lm[1], lm[2]);
+        }
+      }
+    }
+    return { joined: chunks.join('\n'), lineMap };
+  }
+
+  function resolvePineRscValue(val: unknown, lineMap: Map<string, string>, depth = 0): unknown {
+    if (depth > 12) return val;
+    if (typeof val === 'string') {
+      const refMatch = val.match(/^\$(?:L)?([0-9a-f]+)$/);
+      if (refMatch) {
+        const raw = lineMap.get(refMatch[1]);
+        if (raw !== undefined) {
+          if (raw.startsWith('T')) {
+            const commaIdx = raw.indexOf(',');
+            return commaIdx !== -1 ? raw.slice(commaIdx + 1) : raw;
+          }
+          try {
+            return resolvePineRscValue(JSON.parse(raw), lineMap, depth + 1);
+          } catch {
+            return raw;
+          }
+        }
+      }
+      return val;
+    }
+    if (Array.isArray(val)) {
+      return val.map((item) => resolvePineRscValue(item, lineMap, depth + 1));
+    }
+    if (val && typeof val === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(val)) {
+        out[k] = resolvePineRscValue(v, lineMap, depth + 1);
+      }
+      return out;
+    }
+    return val;
+  }
+
+  interface PineDramaCardItem {
+    slug: string;
+    judul: string;
+    sampul: string | null;
+    rating: string | null;
+    jumlah_episode: number | null;
+    genre: Array<{ slug: string; nama: string }>;
+    sinopsis: string | null;
+    url_pinedrama: string;
+  }
+
+  function collectPineDramaCardsFromHtml(html: string, lang: string): PineDramaCardItem[] {
+    const rsc = extractPineDramaRsc(html);
+    const parsedRoots: unknown[] = [];
+    for (const raw of rsc.lineMap.values()) {
+      try {
+        parsedRoots.push(resolvePineRscValue(JSON.parse(raw), rsc.lineMap, 0));
+      } catch {
+        // Non-JSON RSC line
+      }
+    }
+
+    const bySlug = new Map<string, PineDramaCardItem>();
+
+    function extractCardFields(
+      node: unknown,
+      state: {
+        judul: string | null;
+        cover: string | null;
+        rating: string | null;
+        sinopsis: string | null;
+        genres: Array<{ slug: string; nama: string }>;
+      }
+    ) {
+      if (!node) return;
+      if (Array.isArray(node)) {
+        if (node[0] === '$' && typeof node[3] === 'object' && node[3] !== null) {
+          const props = node[3] as Record<string, unknown>;
+          if (props.pathName === 'genres' && typeof props.slug === 'string' && props.slug) {
+            const label = typeof props.children === 'string' ? props.children : props.slug;
+            if (!state.genres.some((g) => g.slug === props.slug)) {
+              state.genres.push({ slug: props.slug, nama: label });
+            }
+          }
+          if (
+            typeof props.src === 'string' &&
+            (props.src.includes('pinedrama.com') || props.src.includes('minishort.com')) &&
+            !state.cover
+          ) {
+            state.cover = props.src;
+          }
+          if (typeof props.className === 'string') {
+            if (
+              props.className.includes('text-yellow-400') &&
+              typeof props.children === 'string' &&
+              /^[0-9.]+$/.test(props.children)
+            ) {
+              state.rating = props.children;
+            }
+            if (props.className.includes('line-clamp-2') && typeof props.children === 'string') {
+              state.sinopsis = props.children;
+            }
+          }
+          if (props.pathName === 'dramas') {
+            if (typeof props.children === 'string' && props.children.trim() && !state.judul) {
+              state.judul = props.children.trim();
+            } else if (typeof props['aria-label'] === 'string' && props['aria-label'].trim() && !state.judul) {
+              state.judul = props['aria-label'].trim();
+            }
+          }
+        }
+        for (const ch of node) {
+          extractCardFields(ch, state);
+        }
+      } else if (typeof node === 'object') {
+        const obj = node as Record<string, unknown>;
+        if (obj.children) {
+          extractCardFields(obj.children, state);
+        }
+      }
+    }
+
+    function walk(node: unknown) {
+      if (!node) return;
+      if (Array.isArray(node)) {
+        if (
+          node[0] === '$' &&
+          node[1] === 'div' &&
+          typeof node[2] === 'string' &&
+          node[2].length > 2 &&
+          node[3] &&
+          typeof node[3] === 'object'
+        ) {
+          const serialized = JSON.stringify(node);
+          if (serialized.includes(`"slug":"${node[2]}"`) && serialized.includes('"pathName":"dramas"')) {
+            const state = {
+              judul: null as string | null,
+              cover: null as string | null,
+              rating: null as string | null,
+              sinopsis: null as string | null,
+              genres: [] as Array<{ slug: string; nama: string }>,
+            };
+            extractCardFields(node[3], state);
+            const prev = bySlug.get(node[2]);
+            if (!prev || (!prev.sinopsis && state.sinopsis) || (!prev.sampul && state.cover)) {
+              bySlug.set(node[2], {
+                slug: node[2],
+                judul: state.judul || node[2],
+                sampul: state.cover,
+                rating: state.rating,
+                jumlah_episode: null,
+                genre: state.genres,
+                sinopsis: state.sinopsis,
+                url_pinedrama: buildPineDramaUrl(lang, `/dramas/${node[2]}`),
+              });
+            }
+            return;
+          }
+        }
+        for (const item of node) walk(item);
+      } else if (typeof node === 'object') {
+        for (const v of Object.values(node)) walk(v);
+      }
+    }
+
+    for (const root of parsedRoots) {
+      walk(root);
+    }
+
+    // Also catch home-page showcase drama links that use href/pathName without keyed outer wrapper
+    if (bySlug.size === 0) {
+      function walkShowcase(node: unknown) {
+        if (!node) return;
+        if (Array.isArray(node)) {
+          if (node[0] === '$' && typeof node[3] === 'object' && node[3] !== null) {
+            const props = node[3] as Record<string, unknown>;
+            if (props.pathName === 'dramas' && typeof props.slug === 'string' && props.slug) {
+              const slug = props.slug;
+              const titleCandidate =
+                (typeof props['aria-label'] === 'string' && props['aria-label'].trim()) ||
+                (typeof props.children === 'string' && props.children.trim()) ||
+                null;
+              let coverCandidate: string | null = null;
+              const serialized = JSON.stringify(node);
+              const covMatch = serialized.match(/"src":"(https:\/\/[^"]+)"/);
+              if (covMatch?.[1]) coverCandidate = covMatch[1];
+
+              const existing = bySlug.get(slug);
+              if (!existing) {
+                bySlug.set(slug, {
+                  slug,
+                  judul: titleCandidate || slug,
+                  sampul: coverCandidate,
+                  rating: null,
+                  jumlah_episode: null,
+                  genre: [],
+                  sinopsis: null,
+                  url_pinedrama: buildPineDramaUrl(lang, `/dramas/${slug}`),
+                });
+              } else {
+                if (titleCandidate && existing.judul === slug) existing.judul = titleCandidate;
+                if (coverCandidate && !existing.sampul) existing.sampul = coverCandidate;
+              }
+            }
+          }
+          for (const ch of node) walkShowcase(ch);
+        } else if (typeof node === 'object') {
+          for (const v of Object.values(node)) walkShowcase(v);
+        }
+      }
+      for (const root of parsedRoots) {
+        walkShowcase(root);
+      }
+    }
+
+    return Array.from(bySlug.values());
+  }
+
+  interface RawPineSummaryItem {
+    cover_url?: string;
+    episode_num?: number;
+    genre_list?: Array<{ genre_slug?: string; name?: string }>;
+    name?: string;
+    rating?: string | number;
+    series_slug?: string;
+    short_desc?: string;
+  }
+
+  interface RawPineDramaDetail {
+    series_slug?: string;
+    name?: string;
+    cover_url?: string;
+    desc?: string;
+    short_desc?: string;
+    rating?: string | number;
+    episode_num?: number;
+    genre_list?: Array<{ genre_slug?: string; name?: string }>;
+    langs_list?: string[];
+    source_language?: string;
+    country_of_origin?: string;
+    release_date?: string;
+    episode_list?: Array<{
+      episode_id?: number;
+      can_play?: boolean;
+      seo_title?: string | null;
+      seo_desc?: string | null;
+    }>;
+    trending_series_slug_list?: RawPineSummaryItem[];
+    youlike_series_slug_list?: RawPineSummaryItem[];
+  }
+
+  function mapPineSummaryItem(item: RawPineSummaryItem, lang: string): PineDramaCardItem | null {
+    const slug = String(item.series_slug || '').trim();
+    if (!slug) return null;
+    return {
+      slug,
+      judul: String(item.name || slug).trim(),
+      sampul: item.cover_url || null,
+      rating: item.rating !== undefined && item.rating !== null && item.rating !== '' ? String(item.rating) : null,
+      jumlah_episode: typeof item.episode_num === 'number' ? item.episode_num : null,
+      genre: Array.isArray(item.genre_list)
+        ? item.genre_list
+            .filter((g) => g.genre_slug || g.name)
+            .map((g) => ({
+              slug: String(g.genre_slug || g.name || '').toLowerCase(),
+              nama: String(g.name || g.genre_slug || ''),
+            }))
+        : [],
+      sinopsis: typeof item.short_desc === 'string' ? item.short_desc : null,
+      url_pinedrama: buildPineDramaUrl(lang, `/dramas/${slug}`),
+    };
+  }
+
+  function extractBalancedJsonObject(haystack: string, marker: string): Record<string, unknown> | null {
+    const idx = haystack.indexOf(marker);
+    if (idx === -1) return null;
+
+    let start = idx;
+    let depth = 0;
+    let found = false;
+    for (let i = idx; i >= 0; i--) {
+      if (haystack[i] === '}') depth++;
+      else if (haystack[i] === '{') {
+        if (depth === 0) {
+          start = i;
+          found = true;
+          break;
+        }
+        depth--;
+      }
+    }
+    if (!found) return null;
+
+    depth = 0;
+    let end = start;
+    let inStr = false;
+    let esc = false;
+    for (let i = start; i < haystack.length; i++) {
+      const ch = haystack[i];
+      if (esc) {
+        esc = false;
+        continue;
+      }
+      if (ch === '\\' && inStr) {
+        esc = true;
+        continue;
+      }
+      if (ch === '"') {
+        inStr = !inStr;
+        continue;
+      }
+      if (!inStr) {
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+          depth--;
+          if (depth === 0) {
+            end = i + 1;
+            break;
+          }
+        }
+      }
+    }
+    if (end <= start) return null;
+    try {
+      return JSON.parse(haystack.slice(start, end)) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+  }
+
+  async function scrapePineDramaDetailFresh(slug: string, lang: string) {
+    const targetUrl = buildPineDramaUrl(lang, `/dramas/${encodeURIComponent(slug)}`);
+    const { status, text: html } = await fetchPineDramaText(targetUrl, 15_000);
+    if (status === 404) return null;
+    if (status < 200 || status >= 400) {
+      throw new Error(`PineDrama mengembalikan HTTP ${status} saat membuka detail drama.`);
+    }
+
+    const rsc = extractPineDramaRsc(html);
+    const rawDetailObj =
+      extractBalancedJsonObject(rsc.joined, `"series_slug":"${slug}"`) ??
+      extractBalancedJsonObject(rsc.joined, '"series_slug":"');
+    if (!rawDetailObj) return null;
+
+    const resolved = resolvePineRscValue(rawDetailObj, rsc.lineMap, 0) as RawPineDramaDetail;
+    const ogImage = html.match(/property="og:image"[^>]*content="([^"]+)"/i)?.[1] || null;
+    const rawEpisodes = Array.isArray(resolved.episode_list) ? resolved.episode_list : [];
+    const episodeWeb = rawEpisodes
+      .filter((ep) => typeof ep.episode_id === 'number')
+      .map((ep) => ({
+        episode_id: ep.episode_id as number,
+        dapat_diputar: Boolean(ep.can_play),
+        judul_episode: ep.seo_title || null,
+        deskripsi_episode: ep.seo_desc || null,
+      }))
+      .sort((a, b) => a.episode_id - b.episode_id);
+
+    const resolvedSlug = String(resolved.series_slug || slug).trim();
+    const coverUrl =
+      typeof resolved.cover_url === 'string' && resolved.cover_url.trim()
+        ? resolved.cover_url.trim()
+        : ogImage;
+
+    const trendingList = (Array.isArray(resolved.trending_series_slug_list)
+      ? resolved.trending_series_slug_list
+      : []
+    )
+      .map((item) => mapPineSummaryItem(item, lang))
+      .filter((x): x is PineDramaCardItem => Boolean(x));
+
+    const forYouList = (Array.isArray(resolved.youlike_series_slug_list)
+      ? resolved.youlike_series_slug_list
+      : []
+    )
+      .map((item) => mapPineSummaryItem(item, lang))
+      .filter((x): x is PineDramaCardItem => Boolean(x));
+
+    return {
+      drama: {
+        slug: resolvedSlug,
+        judul: String(resolved.name || resolvedSlug).trim(),
+        sampul: coverUrl,
+        rating:
+          resolved.rating !== undefined && resolved.rating !== null && resolved.rating !== ''
+            ? String(resolved.rating)
+            : null,
+        sinopsis:
+          typeof resolved.short_desc === 'string' && resolved.short_desc.trim()
+            ? resolved.short_desc.trim()
+            : typeof resolved.desc === 'string'
+            ? resolved.desc.trim()
+            : null,
+        deskripsi_lengkap:
+          typeof resolved.desc === 'string' && !resolved.desc.startsWith('$')
+            ? resolved.desc.trim()
+            : null,
+        jumlah_episode:
+          typeof resolved.episode_num === 'number' ? resolved.episode_num : episodeWeb.length,
+        jumlah_episode_playable: episodeWeb.filter((ep) => ep.dapat_diputar).length,
+        bahasa_tersedia: Array.isArray(resolved.langs_list) ? resolved.langs_list : [lang],
+        bahasa_asli: resolved.source_language || null,
+        asal_negara: resolved.country_of_origin || null,
+        tanggal_rilis: resolved.release_date || null,
+        genre: Array.isArray(resolved.genre_list)
+          ? resolved.genre_list
+              .filter((g) => g.genre_slug || g.name)
+              .map((g) => ({
+                slug: String(g.genre_slug || g.name || '').toLowerCase(),
+                nama: String(g.name || g.genre_slug || ''),
+              }))
+          : [],
+        episode_web: episodeWeb,
+        url_pinedrama: buildPineDramaUrl(lang, `/dramas/${resolvedSlug}`),
+      },
+      rekomendasi_trending: trendingList,
+      rekomendasi_for_you: forYouList,
+    };
+  }
+
+  async function fetchPineDramaDetail(slug: string, lang: string) {
+    const cacheKey = `${lang}:${slug}`;
+    const cached = pineCacheGet(pineDetailCache, cacheKey);
+    if (cached !== undefined) return cached;
+    return withPineInFlight(`detail:${cacheKey}`, async () => {
+      const detail = await scrapePineDramaDetailFresh(slug, lang);
+      if (detail) {
+        pineCacheSet(pineDetailCache, cacheKey, detail, 180_000);
+      }
+      return detail;
+    });
+  }
+
+  async function fetchPineDramaEpisodePlayUrl(slug: string, lang: string, episodeId: number) {
+    const cacheKey = `${lang}:${slug}:${episodeId}`;
+    const cached = pineCacheGet(pinePlayUrlCache, cacheKey);
+    if (cached) return cached;
+
+    return withPineInFlight(`play:${cacheKey}`, async () => {
+      const apiUrl = `https://pinedrama.com/api/episode/getEpisodePlayUrl?series_slug=${encodeURIComponent(
+        slug
+      )}&language=${encodeURIComponent(lang)}&episode_id=${encodeURIComponent(String(episodeId))}`;
+      let lastError: unknown;
+      let parsedBody: {
+        code?: number;
+        msg?: string;
+        data?: { url?: string } | unknown[];
+      } | null = null;
+
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), 15_000);
+        try {
+          const response = await fetch(apiUrl, {
+            signal: controller.signal,
+            headers: {
+              'User-Agent': SCRAPE_UA,
+              Accept: 'application/json, text/plain, */*',
+              Referer: 'https://pinedrama.com/',
+            },
+          });
+          const rawText = await response.text();
+          if (response.status >= 500 && attempt === 0) {
+            lastError = new Error(`PineDrama API mengembalikan HTTP ${response.status}.`);
+            continue;
+          }
+          if (rawText) {
+            try {
+              parsedBody = JSON.parse(rawText) as {
+                code?: number;
+                msg?: string;
+                data?: { url?: string } | unknown[];
+              };
+              break;
+            } catch {
+              if (!response.ok) {
+                throw new Error(`PineDrama API mengembalikan HTTP ${response.status}.`);
+              }
+            }
+          }
+          if (!response.ok) {
+            throw new Error(`PineDrama API mengembalikan HTTP ${response.status}.`);
+          }
+          break;
+        } catch (err) {
+          lastError = err;
+          if (attempt === 1) throw err;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      if (!parsedBody && lastError) {
+        throw lastError instanceof Error ? lastError : new Error('Gagal mengambil URL episode.');
+      }
+
+      const streamUrl =
+        parsedBody?.code === 200 &&
+        parsedBody.data &&
+        !Array.isArray(parsedBody.data) &&
+        typeof parsedBody.data.url === 'string'
+          ? parsedBody.data.url
+          : null;
+      const result = {
+        stream_url: streamUrl,
+        status_stream: streamUrl ? 'tersedia' : 'tidak_tersedia',
+        pesan_server: parsedBody?.msg || (streamUrl ? 'success' : 'Episode unavailable'),
+      };
+      pineCacheSet(pinePlayUrlCache, cacheKey, result, streamUrl ? 300_000 : 60_000);
+      return result;
+    });
+  }
+
+  // 21. GET /api/v1/streaming/pinedrama/for-you
+  app.get('/api/v1/streaming/pinedrama/for-you', async (req: Request, res: Response) => {
+    const lang = normalizePineDramaLang(req.query.lang);
+    const genre = String(req.query.genre || '')
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9-]/g, '');
+    const pageRaw = Number(req.query.page ?? 1);
+    const page = Number.isFinite(pageRaw) && pageRaw >= 1 ? Math.floor(pageRaw) : 1;
+    const limitRaw = Number(req.query.limit ?? 16);
+    const limit = Number.isFinite(limitRaw) ? Math.min(30, Math.max(1, Math.floor(limitRaw))) : 16;
+
+    try {
+      const subPath = genre
+        ? `/genres/${encodeURIComponent(genre)}${page > 1 ? `?page=${page}` : ''}`
+        : `/genres${page > 1 ? `?page=${page}` : ''}`;
+      const pageUrl = buildPineDramaUrl(lang, subPath);
+      const { status, text: html } = await fetchPineDramaTextCached(pageUrl, 180_000, 15_000);
+      if (status < 200 || status >= 400) {
+        return res.status(502).json({
+          sukses: false,
+          kesalahan: {
+            kode: 'UPSTREAM_PINEDRAMA_ERROR',
+            pesan: `PineDrama mengembalikan status HTTP ${status} untuk halaman katalog.`,
+          },
+        });
+      }
+
+      const genreCards = collectPineDramaCardsFromHtml(html, lang);
+      const mergedMap = new Map<string, PineDramaCardItem>();
+
+      // Merge live "You Might Also Like" (For You) list from seed drama detail page on page 1
+      if (!genre && page === 1 && genreCards.length > 0) {
+        try {
+          const detailSeed = await fetchPineDramaDetail(genreCards[0].slug, lang);
+          if (detailSeed?.rekomendasi_for_you) {
+            for (const item of detailSeed.rekomendasi_for_you) {
+              mergedMap.set(item.slug, item);
+            }
+          }
+        } catch {
+          // Continue with genreCards if detail seed fails
+        }
+      }
+
+      for (const card of genreCards) {
+        if (!mergedMap.has(card.slug)) {
+          mergedMap.set(card.slug, card);
+        }
+      }
+
+      const dramas = Array.from(mergedMap.values()).slice(0, limit);
+      return res.json({
+        sukses: true,
+        layanan: 'pinedrama-for-you',
+        sumber_data: 'pinedrama-live-scrape',
+        bahasa: lang,
+        genre: genre || null,
+        halaman: page,
+        jumlah: dramas.length,
+        dramas,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal mengambil data For You dari PineDrama.';
+      return res.status(502).json({
+        sukses: false,
+        kesalahan: { kode: 'UPSTREAM_PINEDRAMA_ERROR', pesan: msg },
+      });
+    }
+  });
+
+  // 22. GET /api/v1/streaming/pinedrama/trending
+  app.get('/api/v1/streaming/pinedrama/trending', async (req: Request, res: Response) => {
+    const lang = normalizePineDramaLang(req.query.lang);
+    const limitRaw = Number(req.query.limit ?? 12);
+    const limit = Number.isFinite(limitRaw) ? Math.min(24, Math.max(1, Math.floor(limitRaw))) : 12;
+
+    try {
+      const genresUrl = buildPineDramaUrl(lang, '/genres');
+      const { status, text: genresHtml } = await fetchPineDramaTextCached(genresUrl, 180_000, 15_000);
+      if (status < 200 || status >= 400) {
+        return res.status(502).json({
+          sukses: false,
+          kesalahan: {
+            kode: 'UPSTREAM_PINEDRAMA_ERROR',
+            pesan: `PineDrama mengembalikan status HTTP ${status}.`,
+          },
+        });
+      }
+
+      const genreCards = collectPineDramaCardsFromHtml(genresHtml, lang);
+      const mergedMap = new Map<string, PineDramaCardItem>();
+
+      const [seedDetail, secondDetail, homeRes] = await Promise.all([
+        genreCards.length > 0 ? fetchPineDramaDetail(genreCards[0].slug, lang).catch(() => null) : Promise.resolve(null),
+        genreCards.length > 1 && limit > 6
+          ? fetchPineDramaDetail(genreCards[1].slug, lang).catch(() => null)
+          : Promise.resolve(null),
+        limit > 6
+          ? fetchPineDramaTextCached(buildPineDramaUrl(lang, ''), 180_000, 12_000).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+
+      if (seedDetail?.rekomendasi_trending) {
+        for (const item of seedDetail.rekomendasi_trending) {
+          mergedMap.set(item.slug, item);
+        }
+      }
+      if (mergedMap.size < limit && secondDetail?.rekomendasi_trending) {
+        for (const item of secondDetail.rekomendasi_trending) {
+          if (!mergedMap.has(item.slug)) mergedMap.set(item.slug, item);
+        }
+      }
+      if (mergedMap.size < limit) {
+        if (homeRes && homeRes.status >= 200 && homeRes.status < 400) {
+          for (const c of collectPineDramaCardsFromHtml(homeRes.text, lang)) {
+            if (!mergedMap.has(c.slug)) mergedMap.set(c.slug, c);
+          }
+        }
+        for (const c of genreCards) {
+          if (!mergedMap.has(c.slug)) mergedMap.set(c.slug, c);
+        }
+      }
+
+      const dramas = Array.from(mergedMap.values()).slice(0, limit);
+      return res.json({
+        sukses: true,
+        layanan: 'pinedrama-trending',
+        sumber_data: 'pinedrama-live-scrape',
+        bahasa: lang,
+        jumlah: dramas.length,
+        dramas,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal mengambil data Trending dari PineDrama.';
+      return res.status(502).json({
+        sukses: false,
+        kesalahan: { kode: 'UPSTREAM_PINEDRAMA_ERROR', pesan: msg },
+      });
+    }
+  });
+
+  // 23. GET /api/v1/streaming/pinedrama/search
+  app.get('/api/v1/streaming/pinedrama/search', async (req: Request, res: Response) => {
+    const q = String(req.query.q || req.query.query || '').trim();
+    const lang = normalizePineDramaLang(req.query.lang);
+    const pageRaw = Number(req.query.page ?? 1);
+    const page = Number.isFinite(pageRaw) && pageRaw >= 1 ? Math.floor(pageRaw) : 1;
+    const limitRaw = Number(req.query.limit ?? req.query.page_size ?? 10);
+    const pageSize = Number.isFinite(limitRaw) ? Math.min(30, Math.max(1, Math.floor(limitRaw))) : 10;
+
+    if (q.length < 2 || q.length > 100) {
+      return res.status(400).json({
+        sukses: false,
+        kesalahan: {
+          kode: 'PARAMETER_TIDAK_VALID',
+          pesan: 'Parameter "q" wajib diisi minimal 2 karakter dan maksimal 100 karakter.',
+        },
+      });
+    }
+
+    const searchCacheKey = `${lang}:${q.toLowerCase()}:${page}:${pageSize}`;
+    const cachedSearch = pineCacheGet(pineSearchCache, searchCacheKey);
+    if (cachedSearch) {
+      return res.json(cachedSearch);
+    }
+
+    try {
+      const payload = await withPineInFlight(`search:${searchCacheKey}`, async () => {
+        const apiUrl = `https://pinedrama.com/api/novels/searchNovelsByQuery?language=${encodeURIComponent(
+          lang
+        )}&query=${encodeURIComponent(q)}&type=series&page=${page}&page_size=${pageSize}`;
+        const upstream = await fetchPineDramaApiJson<{
+          code?: number;
+          msg?: string;
+          data?: {
+            page?: number;
+            page_size?: number;
+            total_count?: number;
+            total_pages?: number;
+            page_data?: Array<{
+              cover_url?: string;
+              episode_num?: number;
+              name?: string;
+              rating?: string | number;
+              series_slug?: string;
+              short_desc?: string;
+              type?: string;
+            }>;
+          };
+        }>(apiUrl, 15_000);
+
+        if (upstream.code !== 200 || !upstream.data) {
+          throw new Error(upstream.msg || 'API pencarian PineDrama tidak mengembalikan respons sukses.');
+        }
+
+        const items = Array.isArray(upstream.data.page_data) ? upstream.data.page_data : [];
+        const dramas = items.map((item) => ({
+          slug: String(item.series_slug || ''),
+          judul: String(item.name || item.series_slug || ''),
+          sampul: item.cover_url || null,
+          rating:
+            item.rating !== undefined && item.rating !== null && item.rating !== ''
+              ? String(item.rating)
+              : null,
+          jumlah_episode: typeof item.episode_num === 'number' ? item.episode_num : null,
+          sinopsis: item.short_desc || null,
+          tipe: item.type || 'series',
+          url_pinedrama: item.series_slug
+            ? buildPineDramaUrl(lang, `/dramas/${item.series_slug}`)
+            : null,
+        }));
+
+        const result = {
+          sukses: true,
+          layanan: 'pinedrama-search',
+          sumber_data: 'pinedrama-api-live',
+          query: q,
+          bahasa: lang,
+          halaman: upstream.data.page ?? page,
+          per_halaman: upstream.data.page_size ?? pageSize,
+          total_hasil: upstream.data.total_count ?? dramas.length,
+          total_halaman: upstream.data.total_pages ?? 1,
+          dramas,
+        };
+        pineCacheSet(pineSearchCache, searchCacheKey, result, 120_000);
+        return result;
+      });
+
+      return res.json(payload);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal menghubungi mesin pencari PineDrama.';
+      return res.status(502).json({
+        sukses: false,
+        kesalahan: { kode: 'UPSTREAM_PINEDRAMA_ERROR', pesan: msg },
+      });
+    }
+  });
+
+  // 24. GET /api/v1/streaming/pinedrama/detail
+  app.get('/api/v1/streaming/pinedrama/detail', async (req: Request, res: Response) => {
+    const requestedLang = req.query.lang ? normalizePineDramaLang(req.query.lang) : null;
+    const parsedInput = parsePineDramaSlugInput(req.query.slug || req.query.url, requestedLang || 'en');
+    const lang = requestedLang || parsedInput.detectedLang;
+    const slug = parsedInput.slug;
+
+    if (!slug || !/^[a-z0-9-]+$/.test(slug)) {
+      return res.status(400).json({
+        sukses: false,
+        kesalahan: {
+          kode: 'PARAMETER_TIDAK_VALID',
+          pesan: 'Parameter "slug" drama PineDrama wajib diisi dengan format slug atau URL yang valid.',
+        },
+      });
+    }
+
+    try {
+      const detail = await fetchPineDramaDetail(slug, lang);
+      if (!detail) {
+        return res.status(404).json({
+          sukses: false,
+          kesalahan: {
+            kode: 'DRAMA_TIDAK_DITEMUKAN',
+            pesan: `Serial drama "${slug}" (${lang}) tidak ditemukan di PineDrama.`,
+          },
+        });
+      }
+
+      return res.json({
+        sukses: true,
+        layanan: 'pinedrama-detail',
+        sumber_data: 'pinedrama-live-scrape',
+        bahasa: lang,
+        drama: detail.drama,
+        rekomendasi_trending: detail.rekomendasi_trending,
+        rekomendasi_for_you: detail.rekomendasi_for_you,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal mengambil detail drama dari PineDrama.';
+      return res.status(502).json({
+        sukses: false,
+        kesalahan: { kode: 'UPSTREAM_PINEDRAMA_ERROR', pesan: msg },
+      });
+    }
+  });
+
+  // 25. GET /api/v1/streaming/pinedrama/get-episodes
+  app.get('/api/v1/streaming/pinedrama/get-episodes', async (req: Request, res: Response) => {
+    const requestedLang = req.query.lang ? normalizePineDramaLang(req.query.lang) : null;
+    const parsedInput = parsePineDramaSlugInput(req.query.slug || req.query.url, requestedLang || 'en');
+    const lang = requestedLang || parsedInput.detectedLang;
+    const slug = parsedInput.slug;
+
+    if (!slug || !/^[a-z0-9-]+$/.test(slug)) {
+      return res.status(400).json({
+        sukses: false,
+        kesalahan: {
+          kode: 'PARAMETER_TIDAK_VALID',
+          pesan: 'Parameter "slug" drama PineDrama wajib diisi dengan format slug atau URL yang valid.',
+        },
+      });
+    }
+
+    const singleEpisodeParam = req.query.episode_id ? Number(req.query.episode_id) : null;
+    if (singleEpisodeParam !== null && (!Number.isInteger(singleEpisodeParam) || singleEpisodeParam < 1)) {
+      return res.status(400).json({
+        sukses: false,
+        kesalahan: {
+          kode: 'EPISODE_ID_TIDAK_VALID',
+          pesan: 'Parameter "episode_id" harus berupa bilangan bulat positif (>= 1).',
+        },
+      });
+    }
+
+    const startRaw = Number(req.query.start ?? 1);
+    const startEp = Number.isFinite(startRaw) && startRaw >= 1 ? Math.floor(startRaw) : 1;
+    const limitRaw = Number(req.query.limit ?? 3);
+    const limit = Number.isFinite(limitRaw) ? Math.min(15, Math.max(1, Math.floor(limitRaw))) : 3;
+
+    // Speculatively start episode playUrl calls in parallel with detail scraping to cut round-trip latency in half
+    const speculativeIds =
+      singleEpisodeParam !== null
+        ? [singleEpisodeParam]
+        : Array.from({ length: limit }, (_, idx) => startEp + idx);
+
+    try {
+      type PlayResult = {
+        ok: boolean;
+        stream_url: string | null;
+        status_stream: string;
+        pesan_server: string;
+      };
+
+      const speculativePlayMap = new Map<number, PlayResult>();
+      const [detail, ...speculativeResults] = await Promise.all([
+        fetchPineDramaDetail(slug, lang),
+        ...speculativeIds.map(async (epId) => {
+          try {
+            const play = await fetchPineDramaEpisodePlayUrl(slug, lang, epId);
+            return { epId, ok: true, ...play };
+          } catch (epErr) {
+            return {
+              epId,
+              ok: false,
+              stream_url: null,
+              status_stream: 'gagal',
+              pesan_server: epErr instanceof Error ? epErr.message : 'Gagal mengambil URL video.',
+            };
+          }
+        }),
+      ]);
+
+      for (const item of speculativeResults) {
+        speculativePlayMap.set(item.epId, {
+          ok: item.ok,
+          stream_url: item.stream_url,
+          status_stream: item.status_stream,
+          pesan_server: item.pesan_server,
+        });
+      }
+
+      if (!detail) {
+        return res.status(404).json({
+          sukses: false,
+          kesalahan: {
+            kode: 'DRAMA_TIDAK_DITEMUKAN',
+            pesan: `Serial drama "${slug}" (${lang}) tidak ditemukan di PineDrama.`,
+          },
+        });
+      }
+
+      const webEpisodeMap = new Map(
+        detail.drama.episode_web.map((ep) => [ep.episode_id, ep] as const)
+      );
+
+      let targetEpisodeIds: number[];
+      if (singleEpisodeParam !== null) {
+        targetEpisodeIds = [singleEpisodeParam];
+      } else {
+        const playableIds = detail.drama.episode_web
+          .filter((ep) => ep.dapat_diputar && ep.episode_id >= startEp)
+          .map((ep) => ep.episode_id);
+        if (playableIds.length > 0) {
+          targetEpisodeIds = playableIds.slice(0, limit);
+        } else if (detail.drama.episode_web.length > 0) {
+          targetEpisodeIds = detail.drama.episode_web
+            .filter((ep) => ep.episode_id >= startEp)
+            .map((ep) => ep.episode_id)
+            .slice(0, limit);
+        } else {
+          targetEpisodeIds = speculativeIds;
+        }
+      }
+
+      // Fetch only episode IDs not already fulfilled speculatively
+      const missingIds = targetEpisodeIds.filter((id) => !speculativePlayMap.has(id));
+      if (missingIds.length > 0) {
+        const extraResults = await Promise.all(
+          missingIds.map(async (epId) => {
+            try {
+              const play = await fetchPineDramaEpisodePlayUrl(slug, lang, epId);
+              return { epId, ok: true, ...play };
+            } catch (epErr) {
+              return {
+                epId,
+                ok: false,
+                stream_url: null,
+                status_stream: 'gagal',
+                pesan_server: epErr instanceof Error ? epErr.message : 'Gagal mengambil URL video.',
+              };
+            }
+          })
+        );
+        for (const item of extraResults) {
+          speculativePlayMap.set(item.epId, {
+            ok: item.ok,
+            stream_url: item.stream_url,
+            status_stream: item.status_stream,
+            pesan_server: item.pesan_server,
+          });
+        }
+      }
+
+      const episodesOut = targetEpisodeIds.map((epId) => {
+        const meta = webEpisodeMap.get(epId);
+        const play = speculativePlayMap.get(epId);
+        const rawVideoUrl = play?.stream_url ?? null;
+        const signedVideo = rawVideoUrl ? buildSignedPineDramaVideoUrls(req, rawVideoUrl) : null;
+        return {
+          episode_id: epId,
+          dapat_diputar: meta
+            ? meta.dapat_diputar || Boolean(rawVideoUrl)
+            : Boolean(rawVideoUrl),
+          judul_episode: meta?.judul_episode ?? null,
+          deskripsi_episode: meta?.deskripsi_episode ?? null,
+          stream_url: signedVideo?.stream_url ?? null,
+          relative_stream_url: signedVideo?.relative_stream_url ?? null,
+          source_cdn_url: signedVideo?.source_cdn_url ?? null,
+          status_stream: play?.status_stream ?? 'tidak_tersedia',
+          pesan_server: play?.pesan_server ?? 'Episode unavailable',
+        };
+      });
+
+      const episodeAktif =
+        episodesOut.find((ep) => Boolean(ep.stream_url)) ?? episodesOut[0] ?? null;
+
+      return res.json({
+        sukses: true,
+        layanan: 'pinedrama-get-episodes',
+        sumber_data: 'pinedrama-api-live',
+        bahasa: lang,
+        drama: {
+          slug: detail.drama.slug,
+          judul: detail.drama.judul,
+          sampul: detail.drama.sampul,
+          rating: detail.drama.rating,
+          url_pinedrama: detail.drama.url_pinedrama,
+        },
+        total_episode_serial: detail.drama.jumlah_episode,
+        total_playable_web: detail.drama.jumlah_episode_playable,
+        jumlah_dimuat: episodesOut.length,
+        semua_episode: detail.drama.episode_web.map((ep) => ({
+          episode_id: ep.episode_id,
+          dapat_diputar: ep.dapat_diputar,
+        })),
+        episode_aktif: episodeAktif,
+        episodes: episodesOut,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Gagal mengambil daftar episode PineDrama.';
+      return res.status(502).json({
+        sukses: false,
+        kesalahan: { kode: 'UPSTREAM_PINEDRAMA_ERROR', pesan: msg },
+      });
+    }
+  });
+
+  // 26. GET /api/v1/streaming/pinedrama/video (Signed MP4 Range Streaming Proxy)
+  app.get('/api/v1/streaming/pinedrama/video', async (req: Request, res: Response) => {
+    const src = String(req.query.src || '').trim();
+    const exp = String(req.query.exp || '').trim();
+    const sig = String(req.query.sig || '').trim();
+
+    if (!src || !exp || !sig || !verifyPineDramaVideoToken(src, exp, sig)) {
+      return res.status(403).json({
+        sukses: false,
+        kesalahan: {
+          kode: 'LINK_VIDEO_TIDAK_VALID',
+          pesan: 'Tautan streaming video tidak valid atau telah kedaluwarsa. Muat ulang endpoint get-episodes.',
+        },
+      });
+    }
+
+    const forwardHeaders: Record<string, string> = {
+      'User-Agent': SCRAPE_UA,
+      Referer: 'https://pinedrama.com/',
+      Origin: 'https://pinedrama.com',
+      Accept: '*/*',
+    };
+    const rangeHeader = req.header('range');
+    if (rangeHeader) {
+      forwardHeaders.Range = rangeHeader;
+    }
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30_000);
+    let upstream: globalThis.Response;
+    try {
+      upstream = await fetch(src, {
+        signal: controller.signal,
+        headers: forwardHeaders,
+        redirect: 'follow',
+      });
+    } catch (err) {
+      clearTimeout(timer);
+      const msg = err instanceof Error ? err.message : 'Gagal menghubungi server video PineDrama.';
+      return res.status(502).json({
+        sukses: false,
+        kesalahan: { kode: 'VIDEO_STREAM_ERROR', pesan: msg },
+      });
+    }
+    clearTimeout(timer);
+
+    if (!upstream.ok || !upstream.body) {
+      return res.status(502).json({
+        sukses: false,
+        kesalahan: {
+          kode: 'VIDEO_STREAM_ERROR',
+          pesan: `Server CDN video PineDrama mengembalikan HTTP ${upstream.status}.`,
+        },
+      });
+    }
+
+    const upstreamType = (upstream.headers.get('content-type') || '').toLowerCase();
+    const mimeType = upstreamType.startsWith('video/') ? upstreamType.split(';')[0] : 'video/mp4';
+
+    res.status(upstream.status === 206 ? 206 : 200);
+    res.setHeader('Content-Type', mimeType);
+    res.setHeader('Accept-Ranges', 'bytes');
+    res.setHeader('Content-Disposition', 'inline; filename="pinedrama-episode.mp4"');
+    res.setHeader('Cache-Control', 'public, max-age=3600');
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+
+    const contentRange = upstream.headers.get('content-range');
+    if (contentRange) res.setHeader('Content-Range', contentRange);
+    const contentLength = upstream.headers.get('content-length');
+    if (contentLength) res.setHeader('Content-Length', contentLength);
+
+    const nodeStream = Readable.fromWeb(
+      upstream.body as unknown as import('node:stream/web').ReadableStream
+    );
+    nodeStream.on('error', () => {
+      if (!res.headersSent) res.status(502).end();
+      else res.end();
+    });
+    res.on('close', () => {
+      try {
+        nodeStream.destroy();
+      } catch {
+        // Ignore close destroy error
+      }
+    });
+    return nodeStream.pipe(res);
   });
 
   // Catch-all for unknown /api/* routes

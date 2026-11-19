@@ -39,6 +39,7 @@ export function SearchModal({
       !deletedEndpointIds.includes(ep.id) &&
       (!q ||
         ep.title.toLowerCase().includes(q) ||
+        (ep.subGroup && ep.subGroup.toLowerCase().includes(q)) ||
         ep.path.toLowerCase().includes(q) ||
         ep.categoryLabel.toLowerCase().includes(q))
   );
@@ -105,7 +106,9 @@ export function SearchModal({
                         {privateEndpointIds.includes(ep.id) && (
                           <Lock className="h-3.5 w-3.5 shrink-0 text-amber-500 dark:text-amber-400" />
                         )}
-                        <span className="truncate">{ep.title}</span>
+                        <span className="truncate">
+                          {ep.subGroup ? `${ep.subGroup} · ${ep.title}` : ep.title}
+                        </span>
                         {privateEndpointIds.includes(ep.id) && (
                           <span className="shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1.5 py-0.5 font-mono text-[9px] font-semibold uppercase text-amber-700 dark:text-amber-300">
                             Private

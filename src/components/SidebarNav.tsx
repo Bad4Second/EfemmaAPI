@@ -34,6 +34,7 @@ const CATEGORY_GROUPS: Array<{ id: ApiCategory; label: string }> = [
   { id: 'kurs', label: 'Konversi Mata Uang' },
   { id: 'integrasi', label: 'Integrasi Pihak Ketiga' },
   { id: 'spotify', label: 'Spotify Music & Audio' },
+  { id: 'streaming', label: 'Streaming' },
 ];
 
 export function SidebarNav({
@@ -56,6 +57,8 @@ export function SidebarNav({
     kurs: true,
     integrasi: true,
     spotify: true,
+    streaming: true,
+    'streaming:PineDrama': true,
   });
 
   const orderedGroups = useMemo(() => {
@@ -221,42 +224,101 @@ export function SidebarNav({
                       transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
                       className="overflow-hidden"
                     >
-                      <div className="ml-3.5 border-l border-slate-200/70 pl-2.5 dark:border-white/[0.08] space-y-0.5 py-0.5">
-                        {endpoints.map((ep) => {
-                          const active =
-                            currentRoute.page === 'docs' && currentRoute.endpointId === ep.id;
-                          return (
-                            <button
-                              key={ep.id}
-                              type="button"
-                              onClick={() => handleGo({ page: 'docs', endpointId: ep.id })}
-                              className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors duration-150 cursor-pointer ${
-                                active
-                                  ? 'bg-sky-500/12 font-semibold text-sky-700 dark:bg-sky-500/15 dark:text-sky-300'
-                                  : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/[0.03] dark:hover:text-slate-200'
-                              }`}
-                            >
-                              <span className="flex items-center gap-1.5 min-w-0">
-                                {privateEndpointIds.includes(ep.id) && (
-                                  <Lock
-                                    className="h-3 w-3 shrink-0 text-amber-500 dark:text-amber-400"
-                                    aria-label="Endpoint Private"
-                                  />
-                                )}
-                                <span className="truncate">{ep.title}</span>
-                              </span>
-                              <span
-                                className={`shrink-0 font-mono text-[10px] font-semibold ${
-                                  ep.method === 'GET'
-                                    ? 'text-emerald-600 dark:text-emerald-400'
-                                    : 'text-sky-600 dark:text-sky-400'
+                      <div className="ml-3.5 border-l border-slate-200/70 pl-2.5 dark:border-white/[0.08] space-y-1 py-0.5">
+                        {(() => {
+                          const directEndpoints = endpoints.filter((ep) => !ep.subGroup);
+                          const subGroupNames: string[] = [];
+                          const subGroupMap = new Map<string, typeof endpoints>();
+                          for (const ep of endpoints) {
+                            if (!ep.subGroup) continue;
+                            if (!subGroupMap.has(ep.subGroup)) {
+                              subGroupNames.push(ep.subGroup);
+                              subGroupMap.set(ep.subGroup, []);
+                            }
+                            subGroupMap.get(ep.subGroup)!.push(ep);
+                          }
+
+                          const renderEndpointBtn = (ep: (typeof endpoints)[number]) => {
+                            const active =
+                              currentRoute.page === 'docs' && currentRoute.endpointId === ep.id;
+                            return (
+                              <button
+                                key={ep.id}
+                                type="button"
+                                onClick={() => handleGo({ page: 'docs', endpointId: ep.id })}
+                                className={`flex w-full items-center justify-between gap-2 rounded-md px-2.5 py-1.5 text-left text-[13px] transition-colors duration-150 cursor-pointer ${
+                                  active
+                                    ? 'bg-sky-500/12 font-semibold text-sky-700 dark:bg-sky-500/15 dark:text-sky-300'
+                                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-400 dark:hover:bg-white/[0.03] dark:hover:text-slate-200'
                                 }`}
                               >
-                                {ep.method}
-                              </span>
-                            </button>
+                                <span className="flex items-center gap-1.5 min-w-0">
+                                  {privateEndpointIds.includes(ep.id) && (
+                                    <Lock
+                                      className="h-3 w-3 shrink-0 text-amber-500 dark:text-amber-400"
+                                      aria-label="Endpoint Private"
+                                    />
+                                  )}
+                                  <span className="truncate">{ep.title}</span>
+                                </span>
+                                <span
+                                  className={`shrink-0 font-mono text-[10px] font-semibold ${
+                                    ep.method === 'GET'
+                                      ? 'text-emerald-600 dark:text-emerald-400'
+                                      : 'text-sky-600 dark:text-sky-400'
+                                  }`}
+                                >
+                                  {ep.method}
+                                </span>
+                              </button>
+                            );
+                          };
+
+                          return (
+                            <>
+                              {directEndpoints.map(renderEndpointBtn)}
+                              {subGroupNames.map((subName) => {
+                                const subKey = `${group.id}:${subName}`;
+                                const isSubOpen = openGroups[subKey] ?? true;
+                                const subEndpoints = subGroupMap.get(subName) ?? [];
+                                return (
+                                  <div key={subKey} className="space-y-0.5 pt-0.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleGroup(subKey)}
+                                      className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-[13px] font-medium text-slate-700 transition-colors duration-150 hover:bg-slate-50 hover:text-slate-900 dark:text-slate-200 dark:hover:bg-white/[0.04] cursor-pointer"
+                                    >
+                                      <span className="truncate">{subName}</span>
+                                      <ChevronDown
+                                        className={`h-3.5 w-3.5 shrink-0 transition-transform duration-200 ease-out-expo ${
+                                          isSubOpen
+                                            ? 'rotate-0 text-slate-500 dark:text-slate-400'
+                                            : '-rotate-90 text-slate-400'
+                                        }`}
+                                      />
+                                    </button>
+
+                                    <AnimatePresence initial={false}>
+                                      {isSubOpen && (
+                                        <motion.div
+                                          initial={{ opacity: 0, height: 0 }}
+                                          animate={{ opacity: 1, height: 'auto' }}
+                                          exit={{ opacity: 0, height: 0 }}
+                                          transition={{ duration: 0.2, ease: [0.22, 1, 0.36, 1] }}
+                                          className="overflow-hidden"
+                                        >
+                                          <div className="ml-3 border-l border-slate-200/70 pl-2.5 dark:border-white/[0.08] space-y-0.5 py-0.5">
+                                            {subEndpoints.map(renderEndpointBtn)}
+                                          </div>
+                                        </motion.div>
+                                      )}
+                                    </AnimatePresence>
+                                  </div>
+                                );
+                              })}
+                            </>
                           );
-                        })}
+                        })()}
                       </div>
                     </motion.div>
                   )}

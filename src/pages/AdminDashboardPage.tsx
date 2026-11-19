@@ -1699,6 +1699,7 @@ export function AdminDashboardPage({
               if (!q) return true;
               return (
                 ep.title.toLowerCase().includes(q) ||
+                (ep.subGroup && ep.subGroup.toLowerCase().includes(q)) ||
                 ep.path.toLowerCase().includes(q) ||
                 ep.categoryLabel.toLowerCase().includes(q)
               );
@@ -1875,7 +1876,7 @@ export function AdminDashboardPage({
                       <div className="min-w-0 flex-1 space-y-1">
                         <div className="flex flex-wrap items-center gap-1.5 sm:gap-2">
                           <span className="font-semibold text-slate-900 dark:text-white break-words">
-                            {ep.title}
+                            {ep.subGroup ? `${ep.subGroup} · ${ep.title}` : ep.title}
                           </span>
                           <span className="rounded border border-slate-200 px-1.5 py-0.5 font-mono text-[10px] text-slate-600 dark:border-white/10 dark:text-slate-300">
                             {ep.categoryLabel}

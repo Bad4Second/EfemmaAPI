@@ -41,7 +41,7 @@ interface LatencyMonitorPanelProps {
   onNavigate: (route: PageRoute) => void;
 }
 
-type CategoryFilter = 'all' | 'integrasi' | 'spotify' | 'cuaca' | 'kurs';
+type CategoryFilter = 'all' | 'integrasi' | 'spotify' | 'streaming' | 'cuaca' | 'kurs';
 type SortMode = 'avg-desc' | 'avg-asc' | 'req-desc';
 type ChartOrientation = 'horizontal' | 'vertical';
 
@@ -550,6 +550,7 @@ export function LatencyMonitorPanel({
                 { id: 'all', label: 'Semua Kategori' },
                 { id: 'integrasi', label: CATEGORY_LABELS.integrasi },
                 { id: 'spotify', label: CATEGORY_LABELS.spotify },
+                { id: 'streaming', label: CATEGORY_LABELS.streaming },
                 { id: 'cuaca', label: CATEGORY_LABELS.cuaca },
                 { id: 'kurs', label: CATEGORY_LABELS.kurs },
               ] as const

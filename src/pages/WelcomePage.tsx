@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react';
 import { ArrowRight, CreditCard, Home, KeyRound, Terminal } from 'lucide-react';
 import defaultWelcomeBannerImg from '../assets/images/hero_efemma_infra_1794799003307.jpg';
 import { API_ENDPOINTS } from '../data/apiCatalog';
-import { PageRoute, SiteContent, UserProfile } from '../types/app';
+import { DEFAULT_CATEGORY_ORDER, PageRoute, SiteContent, UserProfile } from '../types/app';
 
 interface WelcomePageProps {
   content: SiteContent;
@@ -31,7 +31,7 @@ export function WelcomePage({
   const order =
     Array.isArray(content.categoryOrder) && content.categoryOrder.length > 0
       ? content.categoryOrder
-      : ['cuaca', 'kurs', 'integrasi', 'spotify'];
+      : DEFAULT_CATEGORY_ORDER;
 
   const firstVisibleEndpointId =
     [...API_ENDPOINTS]
